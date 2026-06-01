@@ -44,7 +44,7 @@ This is a **local, single-machine pipeline**. It is not a full replica of Nebius
 ### 2. Install
 
 ```bash
-cd pr_to_swe_rebench_jsonl
+cd swe-bench-taskgen
 pip install -e .
 ```
 
@@ -268,7 +268,7 @@ Patch vs test splitting uses the same OpenAI-compatible chat JSON pattern as oth
 ## Project layout
 
 ```
-pr_to_swe_rebench_jsonl/
+swe-bench-taskgen/
   README.md                 # This file
   pyproject.toml            # Package metadata and dependencies
   example_pr_urls.txt       # Sample input
