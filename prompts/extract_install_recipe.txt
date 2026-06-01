@@ -1,0 +1,132 @@
+You extract a **replayable** Docker install recipe from repository files.
+
+Repository: {{repo_name}}
+
+Files:
+{{rendered}}
+
+Return **only** one valid JSON object (no markdown fence, no `//` comments, no trailing commas).
+
+## JSON schema
+
+{
+  "python": "3.11",
+  "install": "pip install -e .",
+  "test_cmd": "pytest -rA",
+  "pre_install": ["apt-get update -qq", "apt-get install -y --no-install-recommends git build-essential"],
+  "pip_packages": ["pip", "wheel", "setuptools", "pytest"],
+  "reqs_path": [],
+  "post_install": [],
+  "pytest_plugins": []
+}
+
+Harness order: `pre_install` → `pip_packages` (each entry: `python3 -m pip install -q <entry>`) → `reqs_path` → `install` → `post_install` → pytest with `pytest_plugins`.
+
+### `test_cmd` (SWE-bench log parsing)
+
+- **Never** use **`pytest -q`** or **`--quiet`**: SWE-bench grading expects lines that start with **`PASSED`**, **`FAILED`**, etc.; quiet mode hides them and marks every test as failed.
+- Prefer **`pytest -rA`** (same idea as upstream SWE-bench: short summary lines are parseable). **`pytest -v`**, **`pytest`**, or other non-quiet invocations are acceptable as long as they are not quiet.
+
+## Headless Docker rules
+
+- `pip_packages`: **only** simple requirement strings (`pytest`, `numpy>=1.20`) — never full `pip install ...` commands, never `-e .[extra]`, never PyQt5/PySide/pyobjc/qtpy.
+- **Never** use `install` with `.[all]`, `.[complete]`, or `.[clipboard]` (they pull PyQt5 and fail without qmake).
+- Do not set `reqs_path` to files that install optional/GUI stacks unless you are certain they are headless-safe.
+- Use `pre_install` for apt packages (git, build-essential, compilers).
+- Use `post_install` for steps that must run after the main install (meson build, extra test extras, pytest plugins).
+
+## meson-python backend (if `pyproject.toml` uses meson-python / mesonpy, or root `meson.build` exists)
+
+Use exactly this pattern:
+
+{
+  "python": "3.11",
+  "install": "# editable install in post_install",
+  "test_cmd": "pytest -rA",
+  "pre_install": [
+    "apt-get update -qq",
+    "apt-get install -y --no-install-recommends git build-essential"
+  ],
+  "pip_packages": ["pip", "wheel", "setuptools", "pytest"],
+  "reqs_path": [],
+  "post_install": [
+    "python3 -m pip install -q --upgrade pip wheel setuptools",
+    "python3 -m pip install -q meson-python meson ninja versioneer \"cython>=3.0.5\" numpy python-dateutil pytz tzdata",
+    "meson subprojects download --force-redownload 2>/dev/null || meson subprojects download",
+    "python3 -m pip install -q -e \".[test,pyarrow]\" --no-build-isolation",
+    "python3 -m pip uninstall -y pytest-httpserver 2>/dev/null || true",
+    "python3 -m pip install -q pytest-localserver"
+  ],
+  "pytest_plugins": ["pytest_localserver"]
+}
+
+## Django runtests (if `tests/runtests.py` exists in the file tree)
+
+Use SWE-bench-compatible **runtests** (not pytest file paths):
+
+{
+  "python": "3.12",
+  "install": "pip install -e .",
+  "test_cmd": "./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1",
+  "pre_install": [
+    "apt-get update -qq",
+    "apt-get install -y --no-install-recommends git build-essential"
+  ],
+  "pip_packages": ["pip", "wheel", "setuptools"],
+  "reqs_path": ["tests/requirements/py3.txt"],
+  "post_install": [],
+  "eval_commands": [
+    "export LANG=en_US.UTF-8",
+    "export LC_ALL=en_US.UTF-8",
+    "export PYTHONIOENCODING=utf8",
+    "export LANGUAGE=en_US:en"
+  ]
+}
+
+Do **not** use `pytest-django`, `swe_rebench_pytest_settings`, or `tests/requirements/mysql.txt` unless strictly required.
+
+## Java / Gradle (if repo has `gradlew` or `build.gradle`, not root `pom.xml`)
+
+Set `"java_build_system": "gradle"` and `"docker_image": "eclipse-temurin:17-jdk-jammy"`.
+
+- `install`: `chmod +x ./gradlew 2>/dev/null || true` (never bare `mvn` at repo root).
+- `post_install`: compile test sources for modules touched by tests, e.g. `./gradlew --no-daemon -q :module:compileTestJava -x check || true`
+- `test_cmd`: run module tests, e.g. `./gradlew --no-daemon -q :module:test --continue || true`
+- `pre_install`: include `python3 unzip curl` (JUnit merge script needs python3).
+- Do **not** put comments-only strings in `install` (use real shell commands).
+
+## Java / Maven (if root `pom.xml` exists and no Gradle wrapper)
+
+Set `"java_build_system": "maven"` and `"docker_image": "maven:3.9-eclipse-temurin-17"`.
+
+- `install`: `mvn -q -DskipTests package || mvn -q -DskipTests compile`
+- `test_cmd`: `mvn -q test -Dmaven.test.failure.ignore=true`
+
+## JavaScript / Node (if `package.json` exists)
+
+Use **Jest + jest-junit** for Docker discover (not pytest).
+
+- `docker_specs`: `{ "node_version": "22.12.0" }` — match `engines.node` in `package.json` when present (prefer 22 LTS or 20.19+, never 21).
+- `install`: `npm ci || npm install`; for Electron apps use `npm ci --ignore-scripts || npm install --ignore-scripts`.
+- `test_cmd`: scoped Jest with JUnit output, e.g. `cd /testbed && npx jest --ci --forceExit --reporters=default --reporters=jest-junit --outputFile=__JUNIT_OUT__ test/foo.test.js` — use `npx jest` or `./node_modules/.bin/jest`, never bare `jest`. Use placeholder `__JUNIT_OUT__` for the report path.
+- `post_install`: include `export PATH="$(pwd)/node_modules/.bin:$PATH"` and `npm install --save-dev jest-junit`.
+- `pre_install`: may include `export ELECTRON_SKIP_BINARY_DOWNLOAD=1` for Electron repos.
+- **Never** append `; exit 0` or `|| true` to `test_cmd` (hides failures and yields empty JUnit).
+- Do **not** use pytest for JavaScript repos.
+
+## C / CMake (if `CMakeLists.txt` or C sources with `tests/`)
+
+Set `"language": "c"`.
+
+- `install`: `mkdir -p build && cd build && cmake .. && cmake --build .` (adjust for repo bootstrap/Makefile if present).
+- `test_cmd`: `cd build && ctest --output-on-failure`
+- `pre_install`: must include `apt-get update -qq` and `apt-get install -y --no-install-recommends git build-essential cmake pkg-config` plus any libs the repo needs (SDL2: `libsdl2-dev libsdl2-mixer-dev libsdl2-net-dev`; uuid: `libuuid-dev`; PNG: `libpng-dev`).
+- `apt-pkgs`: same Debian package names as in `pre_install` (for harness env image).
+- Do **not** use `pip_packages`, `pytest`, or Python-only fields.
+
+## Other repos
+
+- `install`: prefer `pip install -e .` or `pip install -e ".[test]"` / `.[dev]` — never `.[all]`.
+- Add `pytest-localserver` + `pytest_plugins: ["pytest_localserver"]` only if tests use `httpserver.serve_content`.
+- `reqs_path` must be paths that exist in the provided files.
+- Include `python`, `install`, `test_cmd` always.

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pr-to-swe-rebench-jsonl"
+version = "0.1.0"
+description = "Build SWE-rebench-style JSONL rows from GitHub PR URLs (15-field schema)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "docker>=6.0.0",
+    "requests>=2.28.0",
+    "unidiff>=0.7.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+swebench = ["docker>=6.0.0", "requests>=2.28.0", "unidiff>=0.7.0"]
+
+[project.scripts]
+pr-to-swe-rebench-jsonl = "swe_rebench_pr.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["swe_rebench_pr*"]

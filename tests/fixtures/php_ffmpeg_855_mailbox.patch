@@ -1,0 +1,383 @@
+From 11781c7530b4f8acad5b1d7837316e95d7b16fc8 Mon Sep 17 00:00:00 2001
+From: pascalbaljet <pascal@pascalbaljet.nl>
+Date: Tue, 22 Feb 2022 16:27:19 +0100
+Subject: [PATCH 1/2] Specify temporary directory
+
+---
+ CHANGELOG.md                                  |  5 +++
+ README.md                                     |  8 ++++
+ src/FFMpeg/Media/AbstractMediaType.php        | 13 ++++++
+ src/FFMpeg/Media/AbstractVideo.php            |  2 +-
+ src/FFMpeg/Media/Concat.php                   |  2 +-
+ tests/FFMpeg/Unit/Media/AdvancedMediaTest.php | 44 +++++++++++++++++--
+ 6 files changed, 69 insertions(+), 5 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index afb89fa1..cbe43467 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,11 @@
+ 
+ All Notable changes to the library will be documented in this file
+ 
++## 1.0.1 - 2022-02-22
++
++- Added configuration key to customize the temporary directory used for passes.
++- Fix for the path of the default `ffmpeg-passes*` temporary directory.
++
+ ## 1.0.0 - 2022-02-09
+ 
+ Upgraded dependencies, integrated the Alchemy Binary library, and dropped support for anything below PHP 8.0
+diff --git a/README.md b/README.md
+index 67ea05a9..7fbfb349 100644
+--- a/README.md
++++ b/README.md
+@@ -79,6 +79,14 @@ $ffmpeg = FFMpeg\FFMpeg::create(array(
+ ), $logger);
+ ```
+ 
++You may pass a `temporary_directory` key to specify a path for temporary files.
++
++```php
++$ffmpeg = FFMpeg\FFMpeg::create(array(
++    'temporary_directory' => '/var/ffmpeg-tmp'
++), $logger);
++```
++
+ ### Manipulate media
+ 
+ `FFMpeg\FFMpeg` creates media based on URIs. URIs could be either a pointer to a
+diff --git a/src/FFMpeg/Media/AbstractMediaType.php b/src/FFMpeg/Media/AbstractMediaType.php
+index 2b3ef0ca..3a7aa50c 100644
+--- a/src/FFMpeg/Media/AbstractMediaType.php
++++ b/src/FFMpeg/Media/AbstractMediaType.php
+@@ -14,6 +14,7 @@
+ use FFMpeg\Driver\FFMpegDriver;
+ use FFMpeg\FFProbe;
+ use FFMpeg\Filters\FiltersCollection;
++use Spatie\TemporaryDirectory\TemporaryDirectory;
+ 
+ abstract class AbstractMediaType implements MediaTypeInterface
+ {
+@@ -96,6 +97,18 @@ public function getFiltersCollection()
+         return $this->filters;
+     }
+ 
++    /**
++     * Returns a new instance of TemporaryDirectory with the optionally configured directory.
++     *
++     * @return \Spatie\TemporaryDirectory\TemporaryDirectory
++     */
++    public function getTemporaryDirectory(): TemporaryDirectory
++    {
++        return new TemporaryDirectory(
++            $this->driver->getConfiguration()->get('temporary_directory') ?: ''
++        );
++    }
++
+     protected function cleanupTemporaryFile($filename)
+     {
+         if (file_exists($filename) && is_writable($filename)) {
+diff --git a/src/FFMpeg/Media/AbstractVideo.php b/src/FFMpeg/Media/AbstractVideo.php
+index e2a057f5..93f21b99 100644
+--- a/src/FFMpeg/Media/AbstractVideo.php
++++ b/src/FFMpeg/Media/AbstractVideo.php
+@@ -267,7 +267,7 @@ protected function buildCommand(FormatInterface $format, $outputPathfile)
+         }
+ 
+         $this->fsId = uniqid('ffmpeg-passes');
+-        $this->fs = (new TemporaryDirectory($this->fsId))->create();
++        $this->fs = $this->getTemporaryDirectory()->name($this->fsId)->create();
+         $passPrefix = $this->fs->path(uniqid('pass-'));
+         touch($passPrefix);
+         $passes = [];
+diff --git a/src/FFMpeg/Media/Concat.php b/src/FFMpeg/Media/Concat.php
+index ecd213e1..7ef0cf4e 100644
+--- a/src/FFMpeg/Media/Concat.php
++++ b/src/FFMpeg/Media/Concat.php
+@@ -85,7 +85,7 @@ public function saveFromSameCodecs($outputPathfile, $streamCopy = true)
+          */
+ 
+         // Create the file which will contain the list of videos
+-        $fs = (new TemporaryDirectory())->create();
++        $fs = $this->getTemporaryDirectory()->create();
+         $sourcesFile = $fs->path('ffmpeg.concat');
+ 
+         // Set the content of this file
+diff --git a/tests/FFMpeg/Unit/Media/AdvancedMediaTest.php b/tests/FFMpeg/Unit/Media/AdvancedMediaTest.php
+index cc8cbb6b..3f882b1d 100644
+--- a/tests/FFMpeg/Unit/Media/AdvancedMediaTest.php
++++ b/tests/FFMpeg/Unit/Media/AdvancedMediaTest.php
+@@ -8,7 +8,7 @@ class AdvancedMediaTest extends AbstractMediaTestCase
+ {
+     public function testGetInputs()
+     {
+-        $driver = $this->getFFMpegDriverMock();
++        $driver  = $this->getFFMpegDriverMock();
+         $ffprobe = $this->getFFProbeMock();
+ 
+         $advancedMedia = new AdvancedMedia([__FILE__, __FILE__], $driver, $ffprobe);
+@@ -17,7 +17,7 @@ public function testGetInputs()
+ 
+     public function testGetInputsCount()
+     {
+-        $driver = $this->getFFMpegDriverMock();
++        $driver  = $this->getFFMpegDriverMock();
+         $ffprobe = $this->getFFProbeMock();
+ 
+         $advancedMedia = new AdvancedMedia([__FILE__, __FILE__], $driver, $ffprobe);
+@@ -26,10 +26,48 @@ public function testGetInputsCount()
+ 
+     public function testFiltersReturnFilters()
+     {
+-        $driver = $this->getFFMpegDriverMock();
++        $driver  = $this->getFFMpegDriverMock();
+         $ffprobe = $this->getFFProbeMock();
+ 
+         $advancedMedia = new AdvancedMedia([__FILE__, __FILE__], $driver, $ffprobe);
+         $this->assertInstanceOf('FFMpeg\Filters\AdvancedMedia\ComplexFilters', $advancedMedia->filters());
+     }
++
++    public function testGetTemporaryDirectoryWithoutCustomConfiguration()
++    {
++        $driver        = $this->getFFMpegDriverMock();
++        $ffprobe       = $this->getFFProbeMock();
++        $configuration = $this->getConfigurationMock();
++
++        $driver->expects($this->any())
++            ->method('getConfiguration')
++            ->will($this->returnValue($configuration));
++
++        $configuration->expects($this->once())
++            ->method('get')
++            ->with($this->equalTo('temporary_directory'))
++            ->will($this->returnValue(null));
++
++        $advancedMedia = new AdvancedMedia([__FILE__, __FILE__], $driver, $ffprobe);
++        $this->assertEquals('', $advancedMedia->getTemporaryDirectory()->path());
++    }
++
++    public function testGetTemporaryDirectoryWithCustomConfiguration()
++    {
++        $driver        = $this->getFFMpegDriverMock();
++        $ffprobe       = $this->getFFProbeMock();
++        $configuration = $this->getConfigurationMock();
++
++        $driver->expects($this->any())
++            ->method('getConfiguration')
++            ->will($this->returnValue($configuration));
++
++        $configuration->expects($this->once())
++            ->method('get')
++            ->with($this->equalTo('temporary_directory'))
++            ->will($this->returnValue('/var/ffmpeg'));
++
++        $advancedMedia = new AdvancedMedia([__FILE__, __FILE__], $driver, $ffprobe);
++        $this->assertEquals('/var/ffmpeg', $advancedMedia->getTemporaryDirectory()->path());
++    }
+ }
+
+From c97dae8b775c9e16d260f23e61d946c0f052d74c Mon Sep 17 00:00:00 2001
+From: pascalbaljet <pascal@pascalbaljet.nl>
+Date: Tue, 22 Feb 2022 16:52:26 +0100
+Subject: [PATCH 2/2] Test fixes
+
+---
+ composer.json                          |  5 +--
+ tests/FFMpeg/Unit/Media/ConcatTest.php | 26 ++++++++++----
+ tests/FFMpeg/Unit/Media/VideoTest.php  | 49 +++++++++++++++-----------
+ 3 files changed, 50 insertions(+), 30 deletions(-)
+
+diff --git a/composer.json b/composer.json
+index b49c59ad..0677d6e9 100644
+--- a/composer.json
++++ b/composer.json
+@@ -57,7 +57,8 @@
+         "php-ffmpeg/extras": "A compilation of common audio & video drivers for PHP-FFMpeg"
+     },
+     "require-dev": {
+-        "phpunit/phpunit": "^9.5.10"
++        "phpunit/phpunit": "^9.5.10",
++        "mockery/mockery": "^1.5"
+     },
+     "autoload": {
+         "psr-4": {
+@@ -71,4 +72,4 @@
+             "Tests\\FFMpeg\\": "tests/FFMpeg"
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/tests/FFMpeg/Unit/Media/ConcatTest.php b/tests/FFMpeg/Unit/Media/ConcatTest.php
+index 33b6d96d..21e8f1e6 100644
+--- a/tests/FFMpeg/Unit/Media/ConcatTest.php
++++ b/tests/FFMpeg/Unit/Media/ConcatTest.php
+@@ -3,13 +3,14 @@
+ namespace Tests\FFMpeg\Unit\Media;
+ 
+ use FFMpeg\Media\Concat;
++use Mockery;
+ use Spatie\TemporaryDirectory\TemporaryDirectory;
+ 
+ class ConcatTest extends AbstractMediaTestCase
+ {
+     public function testGetSources()
+     {
+-        $driver = $this->getFFMpegDriverMock();
++        $driver  = $this->getFFMpegDriverMock();
+         $ffprobe = $this->getFFProbeMock();
+ 
+         $concat = new Concat([__FILE__, __FILE__], $driver, $ffprobe);
+@@ -18,7 +19,7 @@ public function testGetSources()
+ 
+     public function testFiltersReturnFilters()
+     {
+-        $driver = $this->getFFMpegDriverMock();
++        $driver  = $this->getFFMpegDriverMock();
+         $ffprobe = $this->getFFProbeMock();
+ 
+         $concat = new Concat([__FILE__, __FILE__], $driver, $ffprobe);
+@@ -27,7 +28,7 @@ public function testFiltersReturnFilters()
+ 
+     public function testAddFiltersAddsAFilter()
+     {
+-        $driver = $this->getFFMpegDriverMock();
++        $driver  = $this->getFFMpegDriverMock();
+         $ffprobe = $this->getFFProbeMock();
+ 
+         $filters = $this->getMockBuilder('FFMpeg\Filters\FiltersCollection')
+@@ -50,13 +51,24 @@ public function testAddFiltersAddsAFilter()
+      */
+     public function testSaveFromSameCodecs($streamCopy, $commands)
+     {
+-        $driver = $this->getFFMpegDriverMock();
++        $driver  = $this->getFFMpegDriverMock();
+         $ffprobe = $this->getFFProbeMock();
+ 
+         $pathfile = '/target/destination';
+ 
+         array_push($commands, $pathfile);
+ 
++        $configuration = Mockery::mock('Alchemy\BinaryDriver\ConfigurationInterface');
++
++        $driver->expects($this->any())
++            ->method('getConfiguration')
++            ->will($this->returnValue($configuration));
++
++        $configuration->shouldReceive('get')
++            ->once()
++            ->with('temporary_directory')
++            ->andReturnNull();
++
+         $driver->expects($this->exactly(1))
+             ->method('command')
+             ->with($this->isType('array'), false, $this->anything())
+@@ -79,7 +91,7 @@ public function testSaveFromSameCodecs($streamCopy, $commands)
+ 
+     public function provideSaveFromSameCodecsOptions()
+     {
+-        $fs = (new TemporaryDirectory())->create();
++        $fs      = (new TemporaryDirectory())->create();
+         $tmpFile = $fs->path('ffmpeg-concat');
+         touch($tmpFile);
+ 
+@@ -109,9 +121,9 @@ public function provideSaveFromSameCodecsOptions()
+      */
+     public function testSaveFromDifferentCodecs($commands)
+     {
+-        $driver = $this->getFFMpegDriverMock();
++        $driver  = $this->getFFMpegDriverMock();
+         $ffprobe = $this->getFFProbeMock();
+-        $format = $this->getFormatInterfaceMock();
++        $format  = $this->getFormatInterfaceMock();
+ 
+         $pathfile = '/target/destination';
+ 
+diff --git a/tests/FFMpeg/Unit/Media/VideoTest.php b/tests/FFMpeg/Unit/Media/VideoTest.php
+index 3c00b00a..b6ec08c9 100644
+--- a/tests/FFMpeg/Unit/Media/VideoTest.php
++++ b/tests/FFMpeg/Unit/Media/VideoTest.php
+@@ -5,6 +5,7 @@
+ use FFMpeg\Exception\RuntimeException;
+ use FFMpeg\Format\Video\X264;
+ use FFMpeg\Media\Video;
++use Mockery;
+ 
+ class VideoTest extends AbstractStreamableTestCase
+ {
+@@ -158,25 +159,27 @@ public function testSaveShouldSave($threads, $expectedCommands, $expectedListene
+         $driver  = $this->getFFMpegDriverMock();
+         $ffprobe = $this->getFFProbeMock();
+ 
+-        $configuration = $this->getMockBuilder('Alchemy\BinaryDriver\ConfigurationInterface')->getMock();
++        $configuration = Mockery::mock('Alchemy\BinaryDriver\ConfigurationInterface');
+ 
+         $driver->expects($this->any())
+             ->method('getConfiguration')
+             ->will($this->returnValue($configuration));
+ 
+-        $configuration->expects($this->once())
+-            ->method('has')
+-            ->with($this->equalTo('ffmpeg.threads'))
+-            ->will($this->returnValue($threads));
++        $configuration->shouldReceive('has')
++            ->once()
++            ->with('ffmpeg.threads')
++            ->andReturn($threads);
++
++        $configuration->shouldReceive('get')
++            ->once()
++            ->with('temporary_directory')
++            ->andReturnNull();
+ 
+         if ($threads) {
+-            $configuration->expects($this->once())
+-                ->method('get')
+-                ->with($this->equalTo('ffmpeg.threads'))
+-                ->will($this->returnValue(24));
+-        } else {
+-            $configuration->expects($this->never())
+-                ->method('get');
++            $configuration->shouldReceive('get')
++                ->once()
++                ->with('ffmpeg.threads')
++                ->andReturn(24);
+         }
+ 
+         $capturedCommands  = [];
+@@ -585,21 +588,25 @@ public function testSaveShouldNotStoreCodecFiltersInTheMedia()
+         $driver  = $this->getFFMpegDriverMock();
+         $ffprobe = $this->getFFProbeMock();
+ 
+-        $configuration = $this->getMockBuilder('Alchemy\BinaryDriver\ConfigurationInterface')->getMock();
++        $configuration = Mockery::mock('Alchemy\BinaryDriver\ConfigurationInterface');
+ 
+         $driver->expects($this->any())
+             ->method('getConfiguration')
+             ->will($this->returnValue($configuration));
+ 
+-        $configuration->expects($this->any())
+-            ->method('has')
+-            ->with($this->equalTo('ffmpeg.threads'))
+-            ->will($this->returnValue(true));
++        $configuration->shouldReceive('has')
++            ->with('ffmpeg.threads')
++            ->andReturn(true);
++
++        $configuration->shouldReceive('get')
++            ->once()
++            ->with('ffmpeg.threads')
++            ->andReturn(24);
+ 
+-        $configuration->expects($this->any())
+-            ->method('get')
+-            ->with($this->equalTo('ffmpeg.threads'))
+-            ->will($this->returnValue(24));
++        $configuration->shouldReceive('get')
++            ->once()
++            ->with('temporary_directory')
++            ->andReturnNull();
+ 
+         $capturedCommands = [];
+ 

@@ -1,0 +1,5 @@
+# Optional per-repo install/test overrides (applied after artifact detection).
+# Keys are GitHub ``owner/name`` slugs.
+#
+# Prefer artifact-based hints in repo_detect.py (snapshots, Jest/Mocha, meson, …).
+# Add entries here only when checkout detection cannot express the fix.

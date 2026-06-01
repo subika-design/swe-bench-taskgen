@@ -1,0 +1,62 @@
+Fix the **test_patch** unified diff so `git apply --check` succeeds on a clean checkout at **base_commit**.
+
+Remediation attempt **{{attempt}}** of **{{max_attempts}}**.
+
+{{retry_note}}
+
+## Repository / language
+
+- repo: {{repo}}
+- language: {{language}}
+{{language_notes}}
+
+{{java_harness_context}}
+
+## Problem context
+
+{{problem_context}}
+
+## Implementation patch (for context — do not duplicate production changes into test_patch)
+
+```
+{{impl_patch_excerpt}}
+```
+
+## Current test_patch (broken — git apply failed)
+
+```
+{{test_patch}}
+```
+
+## Apply-check error (fix this exactly)
+
+```
+{{apply_error}}
+```
+
+## Output
+
+Return **only** a JSON object:
+
+{"test_patch": "<full corrected unified diff>"}
+
+## Unified diff rules (critical)
+
+1. Start with `diff --git a/<path> b/<path>` — same path on both sides for new files.
+2. New files need:
+   - `new file mode 100644`
+   - `--- /dev/null`
+   - `+++ b/<path>`
+3. Each hunk header `@@ -old_start,old_count +new_start,new_count @@` counts must match the following lines.
+4. Every hunk body line begins with exactly one of: space, `+`, `-` (no bare text).
+5. Do **not** truncate mid-hunk; do **not** omit closing context lines.
+6. No markdown fences inside the JSON string; use `\n` for newlines in JSON.
+7. Only change **test** files (paths under `src/test/`, `tests/`, `test/`, or `*_test.go`).
+8. The corrected patch must be **different** from the broken patch when the error was structural (corrupt hunk, bad counts).
+
+## Java / Gradle (when language is java)
+
+- Follow the **Java harness** section: keep the same file path and **public class name** as listed there.
+- **already exists in working directory** → switch to **modify** diff (`--- a/path b/path`); never `--- /dev/null`.
+- Do **not** rename the test class (e.g. `MyJettyConfigurationTests` → `JettyMultipleConnectorsTests`) — Gradle `--tests` will miss it.
+- Package must match `src/test/java/...` directories; class name must match filename.

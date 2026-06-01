@@ -1,0 +1,28 @@
+You are tasked with identifying files that likely contain installation instructions for a GitHub repository.
+
+Repository: {{repo_name}}
+
+Below is a list of files in the repository that may be helpful for understanding the installation and setup process:
+
+{{list_of_files}}
+
+Please analyze this list and identify the files that are most likely to contain information about:
+- Installation instructions
+- Dependencies or requirements
+- Setup procedures
+- Development environment configuration
+- Testing setup
+
+Think step by step:
+- Identify README files, as they often contain installation instructions.
+- Look for setup.py, pyproject.toml, requirements.txt, environment.yml.
+- Consider files in directories like docs that might contain installation guides.
+- Look for test configuration files that might help understand how to run tests.
+- Consider only files from the list provided above.
+- Prioritize files in the repository root (top-level directory).
+- Only include files from subdirectories if they are clearly relevant to installation or setup.
+
+Return only a JSON array containing the paths to the most relevant files for installation and setup. Include only files that are directly relevant to the tasks above. Sort the files from most to least relevant and limit your response to no more than 10 files, preferring fewer files that are truly essential.
+
+For example:
+["README.md", "setup.py", "requirements.txt"]

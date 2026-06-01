@@ -1,0 +1,29 @@
+Map Java **test file paths** to Gradle **project paths** for running tests with `./gradlew :<project>:test --tests '<fqcn>'`.
+
+Repository: {{repo}}
+
+## Gradle projects discovered in settings files
+
+{{gradle_projects_block}}
+
+## Test file paths (map every path)
+
+{{test_paths_block}}
+
+## Rules
+
+- Return the Gradle project path **exactly** as used by Gradle (leading `:`), e.g. `:spring-boot-jms` or `:spring-boot-project:spring-boot-docs`.
+- Do **not** invent `:module:spring-boot-jms` unless that exact path appears in the discovered projects list.
+- Match using `projectDir` / directory layout when present: a test under `module/spring-boot-jms/src/test/java/...` usually belongs to `:spring-boot-jms`, not `:module:spring-boot-jms`.
+- One test path → one Gradle project. Multiple paths may share the same project.
+
+## Output
+
+Return **only** a JSON object:
+
+{
+  "mappings": [
+    {"test_path": "<repo-relative path>", "gradle_project": ":<name>"},
+    ...
+  ]
+}

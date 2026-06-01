@@ -1,0 +1,103 @@
+Create a **test_patch** (unified diff only) for a pull request that has **no test changes** in the PR.
+
+The harness will apply `impl.patch` (production diff) then your `test_patch` at `base_commit` in Docker and require:
+- At least one test **fails** before `impl.patch` and **passes** after both patches are applied.
+- All tests introduced in `test_patch` **pass** after both patches are applied.
+
+The patch **must** pass `git apply --check` on the base commit (valid unified diff, correct hunk headers).
+
+## Repository
+
+{{repo}}
+
+## Language
+
+{{language}}
+
+{{language_notes}}
+
+{{java_harness_context}}
+
+## Suggested test file paths (from impl.patch — use one of these layouts)
+
+{{suggested_test_paths}}
+
+## Problem statement
+
+{{problem_statement}}
+
+## Implementation patch (impl.patch — do not duplicate this code in test_patch)
+
+```
+{{patch}}
+```
+
+## Hints
+
+{{hints_text}}
+
+## Output
+
+Return **only** a JSON object:
+
+{"test_patch": "<full unified diff string>"}
+
+## Unified diff checklist (verify before responding)
+
+- [ ] Starts with `diff --git a/... b/...` (same path twice for new files)
+- [ ] New file: includes `new file mode 100644`, `--- /dev/null`, `+++ b/<path>`
+- [ ] Each `@@ ... @@` hunk: line counts match `+`/`-`/context lines below
+- [ ] No line in a hunk without `+`, `-`, or leading space
+- [ ] Patch ends with a newline
+- [ ] JSON contains the raw diff string (no ``` markdown wrappers)
+
+## Example — new Java test file (template)
+
+```
+diff --git a/my-module/src/test/java/com/example/MyFeatureTest.java b/my-module/src/test/java/com/example/MyFeatureTest.java
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/my-module/src/test/java/com/example/MyFeatureTest.java
+@@ -0,0 +1,12 @@
++package com.example;
++
++import org.junit.jupiter.api.Test;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++
++class MyFeatureTest {
++    @Test
++    void shouldExposeFixedBehavior() {
++        assertNotNull("placeholder assertion tied to impl.patch behavior");
++    }
++}
+```
+
+## Rules by language
+
+### Python
+- Paths under `tests/` or `test_*.py`; use pytest style `def test_*`.
+- Do **not** change production/library files.
+
+### Java / Gradle (critical)
+- Use the **Java harness** section above: Gradle runs `--tests '<fqcn>'` for the **public class in your diff**.
+- **Never** invent a new class name if a `*Tests.java` already exists at the suggested path — **modify** that file.
+- Package line must match the directory under `src/test/java/`.
+- **Do not** change the test file path or class name on retries — the harness keys JUnit by that path/FQCN.
+- Assertions must fail before `impl.patch` and pass after both patches (otherwise FAIL_TO_PASS is empty).
+- JUnit showing only `org.springframework.boot.build.*` means the wrong module/class ran — fix path/class to match impl.patch, not buildSrc.
+- Use JUnit 5 (`org.junit.jupiter.api.Test`); one file, 1–3 test methods.
+- Valid unified diff (`git apply --check`); no `new file mode` when apply-check says "already exists".
+
+### Django
+- `tests/...` layout; `TestCase` / `SimpleTestCase`; `test_*` methods.
+- Log keys must match runtests labels, not free-form English strings.
+
+### Go
+- `*_test.go` in the same package directory as the changed code.
+
+## Content rules
+
+- Tests must target the behavior fixed by `impl.patch` / the problem statement.
+- Prefer **one focused test module** (fewer files = fewer apply errors).
+- Minimal fixtures only when required for compilation.

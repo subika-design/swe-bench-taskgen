@@ -1,0 +1,116 @@
+You fix a Linux Docker CI environment so pytest passes on a checked-out repository after patches are applied.
+
+The harness runs **only** what is in `install_config` (no hidden steps). Replay order:
+1. `pre_install` — shell lines (apt-get, etc.)
+2. `pip_packages` — each entry is **one pip requirement** passed to `python3 -m pip install -q <entry>` (NOT a full shell command)
+3. `reqs_path` — `pip install -r` per file if it exists
+4. `install` — one shell line for the project (may be a comment if install is only in `post_install`)
+5. `post_install` — shell lines run **after** step 4 (this is where pandas editable install must happen)
+6. `pytest_plugins` — pytest `-p` module names
+
+Current installation configuration:
+{{install_config}}
+
+Install / Docker logs and pytest diagnostics:
+{{cut_logs}}
+
+## Critical rules (headless Debian Docker)
+
+### PyQt / GUI (causes `qmake` / `PyProjectOptionException`)
+- **Never** use `pip install -e .[all]`, `.[complete]`, `.[clipboard]`, or any extra that pulls PyQt5/PySide.
+- **Never** put in `pip_packages`: PyQt5, PySide, pyobjc, qtpy, or lines containing `pyqt` / `pyside`.
+- **Remove** `reqs_path` entries whose files install GUI stacks (e.g. `requirements-dev.txt` with Qt) if logs show PyQt/qmake errors.
+- Django `tests/requirements/mysql.txt` / `postgres.txt`: keep the path if tests need it; the harness auto-adds apt packages (`libmariadb-dev`, `pkg-config`, `libpq-dev`) to `pre_install`.
+- `pip_packages` must be **simple package names only** (e.g. `pytest`, `wheel`, `setuptools`, `pip`) — never `pip install ...` and never editable installs with extras.
+
+### Django runtests (when `tests/runtests.py` exists or logs show `./tests/runtests.py`)
+Match **SWE-bench** `TEST_DJANGO` + `MAP_REPO_TO_REQS_PATHS["django/django"]` — **not** pytest per-file.
+
+- `test_cmd`: same as SWE-bench `TEST_DJANGO` (`./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1`)
+- `python`: from repo `pyproject.toml` `requires-python` (e.g. `>=3.12` → `"3.12"`)
+- `install`: `pip install -e .` (never meson / `# editable install in post_install`)
+- `reqs_path`: `["tests/requirements/py3.txt"]` unless logs require another file
+- `pip_packages`: `["pip", "wheel", "setuptools"]` only
+- `pre_install`: SWE-bench `SPECS_DJANGO` locale steps + apt deps for requirement files (e.g. `libmemcached-dev` when `pylibmc` is listed)
+- `post_install`: `[]`
+- `eval_commands`: SWE-bench `SPECS_DJANGO` locale exports
+- Do **not** set `pytest_plugins`, `pytest-django`, or `pytest_extra_args`
+- FAIL_TO_PASS names must be **runtests log keys** (e.g. `test_foo (app.tests.Class)`), not pytest nodeids
+
+### meson-python backend (when `pyproject.toml` / logs mention meson-python, mesonpy, or meson build)
+If install failed with PyQt/qmake OR junit shows **0 tests**, replace recipe with this pattern (keep `python` / `test_cmd` from current config if sensible):
+
+- `install`: `# editable install in post_install`
+- `reqs_path`: []  (empty — do not pip install -r files that drag PyQt)
+- `pip_packages`: `["pip", "wheel", "setuptools", "pytest"]` only (add small missing test deps like `hypothesis` if logs require)
+- `pre_install`: must include `apt-get update -qq` and `apt-get install -y --no-install-recommends git build-essential`
+- `post_install` must include **all** of these lines in order (do not return only 1–2 lines):
+  - `python3 -m pip install -q --upgrade pip wheel setuptools`
+  - `python3 -m pip install -q meson-python meson ninja versioneer "cython>=3.0.5" numpy python-dateutil pytz tzdata`
+  - `meson subprojects download --force-redownload 2>/dev/null || meson subprojects download` (required when logs mention `fast_float`, `subprojects directory`, or `Subproject ... is buildable: NO`)
+  - `python3 -m pip install -q -e ".[test,pyarrow]" --no-build-isolation`
+  - `python3 -m pip uninstall -y pytest-httpserver 2>/dev/null || true`
+  - `python3 -m pip install -q pytest-localserver`
+- `pytest_plugins`: `["pytest_localserver"]`
+
+### `test_cmd` (SWE-bench)
+- **Never** `pytest -q` / `--quiet` (breaks SWE-bench log parsing). Prefer **`pytest -rA`**, or **`pytest -v`** / **`pytest`** without quiet flags.
+
+### Java / Maven (when `java_build_system` is `maven` or logs show `mvn test`)
+- **`install`** compiles only: `mvn -q -DskipTests install -pl <module> -am` scoped to modules containing `test_patch` paths.
+- **`test_cmd`** runs tests only (separate from install): `mvn -q test -pl <module> -am -Dmaven.test.failure.ignore=true || true`
+- Map test paths like `gson/src/test/java/...` → module `gson`. **Do not** run the full reactor if unrelated modules fail (e.g. skip `test-jpms` when tests are under `gson/`).
+- Set **`maven_junit_roots`**: `["gson/target/surefire-reports"]` (one entry per module under test).
+- If logs show Maven ran tests but `junit_after_patch=0`, fix **`test_cmd`** and **`maven_junit_roots`**, not `pip_packages`.
+- JPMS errors (`Module com.google.gson not found`) → narrow `-pl` to the module under test; exclude `test-jpms` unless it is in `test_patch_paths_only`.
+- **Old Java / compiler level (critical):** If logs contain `Source option 6 is no longer supported` (or 7), the JDK in `docker_image` is too new for `pom.xml` (`maven.compiler.source` 1.6 / 1.7). **Do not** only tweak `-pl` or repeat the same `mvn` lines.
+  - Set **`docker_image`**: `maven:3.9-eclipse-temurin-8` and **`docker_specs`**: `{"java_version": "8"}`.
+  - Add matching compiler properties on **both** `install` and `test_cmd`, e.g. `-Dmaven.compiler.source=1.6 -Dmaven.compiler.target=1.6` before other goals.
+  - Keep module scoping (`-pl gson -am`) in addition to the above.
+
+### Java / Gradle (when `java_build_system` is `gradle` or logs show `./gradlew`)
+- Keep **`test_cmd`** as `./gradlew ... :module:test --tests 'ClassName'`. Do not replace with `mvn` or `pytest`.
+- If junit is empty but Gradle `BUILD SUCCESSFUL`, fix **`test_cmd`** / **`gradle_junit_roots`**, not Python deps.
+
+### httpserver / serve_content
+- Use `pytest-localserver` + `pytest_plugins: ["pytest_localserver"]`, not `pytest-httpserver`.
+
+### Merge policy
+- Return the **complete** updated config. **Do not** drop the full pandas `post_install` block above when fixing pandas.
+- Add missing deps only when logs show **install failure** or **test failure/error** (`No module named X` → add `X` to `pip_packages` or a `post_install` pip line).
+- If diagnostics say `install_failed: false` and failure=0 and error=0, return the **same** config unchanged (optional pytest skips like fastparquet/moto/xfail do not require changes).
+- If diagnostics mention **junit empty but Maven/Gradle ran**, change **`test_cmd`** / module scoping / junit roots — do **not** repeat the same `install` line unchanged.
+- Do not add PyQt/PySide/pyobjc/qtpy.
+
+### JavaScript / Node (`language` is javascript or repo has `package.json`)
+
+- Use **Jest** or **Vitest** (match `package.json` / `js_test_runner`), not pytest.
+- **Jest** `test_cmd`: `npx jest --ci --forceExit --reporters=default --reporters=jest-junit --outputFile=__JUNIT_OUT__` plus paths from failing tests / `test_patch`.
+- **Vitest** `test_cmd`: `npx vitest run --reporter=junit --outputFile=__JUNIT_OUT__` plus paths from `test_patch` (no jest-junit).
+- **`docker_specs.node_version`**: match `engines.node` (e.g. `22.12.0`); avoid Node 21 when packages require 20.19+ or 22.12+.
+- **`install`**: `npm ci` or `npm ci --ignore-scripts` for Electron; never only `npm test` as install.
+- **`post_install`**: `npm install --save-dev jest-junit` and `export PATH="$(pwd)/node_modules/.bin:$PATH"`.
+- Remove `; exit 0` / `|| true` suffixes from `test_cmd`.
+- If JUnit is empty, fix `test_cmd` / jest-junit or vitest junit reporter / Node version — not only `install`.
+
+### C / CMake (when `language` is `c`, repo has `CMakeLists.txt`, or logs show `cmake` / `ctest` / `fatal error: ... .h`)
+
+- **Do not** use `pip install`, `pytest`, or Python `pip_packages` for C repos.
+- **`install`**: keep CMake/Make bootstrap, e.g. `mkdir -p build && cd build && cmake .. && cmake --build .` or repo-specific `make -f Bootstrap.mak linux`.
+- **`test_cmd`**: `cd build && ctest --output-on-failure` or the repo's native test runner.
+- **Missing headers/libs (critical):** when logs show `fatal error: foo/foo.h: No such file or directory`, `Could NOT find SDL2`, `Could NOT find PNG`, etc., add Debian packages via **both**:
+  - `"apt-pkgs": ["libfoo-dev", ...]` (env image layer), **and**
+  - `"pre_install": ["apt-get update -qq", "apt-get install -y --no-install-recommends git build-essential cmake pkg-config libfoo-dev ..."]`
+- Common mappings:
+  - `uuid/uuid.h` → `libuuid-dev`
+  - `SDL2` / `SDL2_mixer` / `SDL2_net` → `libsdl2-dev`, `libsdl2-mixer-dev`, `libsdl2-net-dev`
+  - `PNG` → `libpng-dev`
+  - `FluidSynth` → `libfluidsynth-dev`
+  - `samplerate` → `libsamplerate0-dev`
+  - `openssl/ssl.h` → `libssl-dev`
+  - `curl/curl.h` → `libcurl4-openssl-dev`
+- **Merge** new packages into existing `pre_install` apt lines; do not drop prior packages.
+- If install failed, **always** add missing apt packages before changing `install`/`test_cmd` unrelated lines.
+
+## Output format
+Return **only** one valid JSON object (no markdown, no comments inside JSON, no trailing commas). Required keys: `python`, `install`, `test_cmd`. Include `pre_install`, `pip_packages`, `reqs_path`, `post_install`, `pytest_plugins`, `apt-pkgs` as needed.

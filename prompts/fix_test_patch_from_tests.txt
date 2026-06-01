@@ -1,0 +1,59 @@
+You fix a PR **test_patch** (unified diff only) so all tests in the **test_patch slice** pass after `impl.patch` and `test_patch` are applied in Docker.
+
+Remediation attempt **{{attempt}}** of **{{max_attempts}}**.
+
+{{runner_note}}
+
+{{java_harness_context}}
+
+{{retry_note}}
+
+Do **not** change production code outside the test_patch diff. Add new files only if they are clearly test support (e.g. under `tests/`).
+
+## Problem context
+
+{{problem_context}}
+
+## Current test_patch
+
+```
+{{test_patch}}
+```
+
+## Latest failures/errors (test_patch slice only — fix every case listed)
+
+```
+{{cut_logs}}
+```
+
+## Output
+
+Return **only** a JSON object:
+
+{"test_patch": "<full updated unified diff string>"}
+
+Rules:
+- Valid unified `diff --git` patch.
+- Minimal change focused on the failure/error messages and tracebacks above.
+- Keep every test file path from `original_test_patch_paths` / `test_patch_paths_only` in the diff.
+- Must differ from the previous patch when failures are listed again after a prior attempt.
+- **ERROR** (not FAIL): read the traceback — fix setup (missing apps, migrations, fixtures), wrong assertions, or incompatible test patterns; do not ignore ERRORs.
+- Django **pickle** / **TestClient** / **ResolverMatch** errors: ensure tests use Django's test utilities correctly; mock only what the traceback requires; avoid pickling objects that hold non-picklable state unless the impl patch explicitly supports it.
+- Django **sites** / migration noise in logs: use `@override_settings`, `TransactionTestCase` with available apps, or isolate tests so migrations from other apps do not break setup.
+- Django autoreload / `get_child_arguments()` under pytest: if the failure shows `-m` and `pytest` in argv but the test expects a script path, add `@mock.patch("__main__.__spec__", None)` on that test. Do **not** change expected argv to include `-m pytest` unless the test targets module execution.
+- For django `TemplateDoesNotExist: generic_views/...`: add templates under `tests/templates/generic_views/` in the diff.
+
+## Java / Gradle — label mismatch / zero matched tests
+
+If diagnostics say **label mismatch** or list only `org.springframework.boot.build.*` / `ConventionsPluginTests`:
+
+- Your tests **did not run**. Docker uses Gradle `--tests '<fqcn>'` from the **Java harness** section — fix the diff so that exact class exists and compiles.
+- **Do not** rename the test file or public class; keep `test_patch_paths_only` stable.
+- If the harness lists an existing path, use a **modify** diff on that file — add/change `@Test` methods, do not create a new path.
+- FQCN = package from `src/test/java/...` + class name matching the `.java` filename.
+- Tests must **fail** before `impl.patch` and **pass** after `impl.patch` + `test_patch` (tight assertion on the bugfix behavior).
+- Ignore unrelated passing JUnit keys from `build/` — they are noise from the wrong suite.
+
+General:
+
+- Valid unified diff (`git apply --check`); JUnit 5; minimal edit to one test class.
