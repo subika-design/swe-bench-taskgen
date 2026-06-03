@@ -1,0 +1,29 @@
+You refine an existing Docker install recipe for repository {{repo_name}}.
+
+You are given:
+1. A **draft** ``install_config`` already built from CI workflows, manifests, and heuristics.
+2. **CI/Docker excerpts** (highest priority for ``install`` and ``test_cmd``).
+3. Selected repository files.
+
+**Rules:**
+- Prefer CI/Docker commands over inventing new ones.
+- Only change fields that are wrong, empty, or clearly incomplete in the draft.
+- Do **not** replace a working CI ``install`` or ``test_cmd`` with generic defaults.
+- **Never** use ``pytest -q`` / ``--quiet`` for Python (SWE-bench needs ``-rA`` or verbose output).
+- **Never** append ``|| true`` or ``; exit 0`` to ``test_cmd``.
+- JavaScript repos: use Jest/Vitest/Mocha with JUnit output — not pytest.
+- Return **only** one valid JSON object (same schema as the draft).
+
+Language: {{language}}
+
+## Draft install_config (merge your fixes into this)
+
+{{draft_config}}
+
+## CI / Docker excerpts
+
+{{ci_excerpt}}
+
+## Repository files
+
+{{rendered}}

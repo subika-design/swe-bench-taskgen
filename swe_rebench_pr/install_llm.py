@@ -16,6 +16,10 @@ _APT_INSTALL_LINE = re.compile(
     r"^apt-get install -y(?:\s+--no-install-recommends)?\s+(.*)$",
     re.IGNORECASE,
 )
+_APT_UPDATE_INSTALL_LINE = re.compile(
+    r"^(apt-get update(?:\s+-qq)?)\s*&&\s*apt-get install -y(?:\s+--no-install-recommends)?\s+(.*)$",
+    re.IGNORECASE,
+)
 from .swebench_align import (
     apt_debian_packages_for_reqs_path as apt_debian_packages_for_reqs_path,
     export_install_config_for_harness,
@@ -28,6 +32,13 @@ def merge_pre_install_debian_packages(pre_install: list[str], deb_packages: list
     """Ensure ``pre_install`` installs *deb_packages* via apt (merge into existing install line)."""
     if not deb_packages:
         return pre_install
+    from .apt_from_log import sanitize_apt_package_names
+    from .integration_build import filter_http3_apt_for_harness
+
+    deb_packages = filter_http3_apt_for_harness(sanitize_apt_package_names(deb_packages))
+    if not deb_packages:
+        return pre_install
+
     pre = list(pre_install)
     want: list[str] = []
     seen: set[str] = set()
@@ -40,11 +51,26 @@ def merge_pre_install_debian_packages(pre_install: list[str], deb_packages: list
     new_pre: list[str] = []
     for ln in pre:
         stripped = ln.strip()
+        combined_update = _APT_UPDATE_INSTALL_LINE.match(stripped)
+        if combined_update and not merged:
+            existing = combined_update.group(2).split()
+            combined: list[str] = []
+            cseen: set[str] = set()
+            for p in existing + want:
+                if p not in cseen:
+                    cseen.add(p)
+                    combined.append(p)
+            update_prefix = combined_update.group(1)
+            new_pre.append(
+                f"{update_prefix} && apt-get install -y --no-install-recommends {' '.join(combined)}"
+            )
+            merged = True
+            continue
         m = _APT_INSTALL_LINE.match(stripped)
         if m and not merged:
             existing = m.group(1).split()
-            combined: list[str] = []
-            cseen: set[str] = set()
+            combined = []
+            cseen = set()
             for p in existing + want:
                 if p not in cseen:
                     cseen.add(p)
@@ -54,15 +80,21 @@ def merge_pre_install_debian_packages(pre_install: list[str], deb_packages: list
                 if "--no-install-recommends" in stripped
                 else "apt-get install -y"
             )
-            new_pre.append(f"{prefix} {' '.join(combined)}")
+            update_prefix = "apt-get update -qq"
+            if not any("apt-get update" in x for x in new_pre):
+                new_pre.append(
+                    f"{update_prefix} && {prefix} {' '.join(combined)}"
+                )
+            else:
+                new_pre.append(f"{prefix} {' '.join(combined)}")
             merged = True
         else:
             new_pre.append(ln)
 
     if not merged:
-        if not any("apt-get update" in ln for ln in new_pre):
-            new_pre = ["apt-get update -qq", *new_pre]
-        new_pre.append(f"apt-get install -y --no-install-recommends {' '.join(want)}")
+        new_pre.append(
+            f"apt-get update -qq && apt-get install -y --no-install-recommends {' '.join(want)}"
+        )
     return new_pre
 
 # Mirrors ``tests/runtests.py`` ``ALWAYS_INSTALLED_APPS`` + per-target test modules.
@@ -373,6 +405,11 @@ def sanitize_install_config_for_docker(
     from .c_build import ensure_c_install_config
 
     out = ensure_c_install_config(out, repo=repo)
+    if repo is not None:
+        from .integration_build import apply_native_build_if_integration, language_supports_native_integration
+
+        if language_supports_native_integration(str(out.get("language") or "")):
+            out = apply_native_build_if_integration(out, repo)
     return out
 
 
@@ -442,11 +479,14 @@ def llm_fix_recipe_from_docker_tests(
     base_url: str,
     model: str,
     timeout_s: int,
+    ci_context: str = "",
 ) -> dict[str, Any]:
     """Update ``install_config`` from pytest JUnit diagnostics (fail / error / import skips)."""
     tpl = load_prompt("fix_install_from_tests.txt")
-    user = tpl.replace("{{install_config}}", json.dumps(install_config, indent=2)).replace(
-        "{{cut_logs}}", diagnostics_text[-120_000:]
+    user = (
+        tpl.replace("{{install_config}}", json.dumps(install_config, indent=2))
+        .replace("{{cut_logs}}", diagnostics_text[-120_000:])
+        .replace("{{ci_context}}", (ci_context or "(none)")[:8000])
     )
     raw = chat_completions(
         api_key=api_key,
@@ -475,6 +515,11 @@ def llm_fix_recipe_from_docker_tests(
     merged = merge_ruby_harness_fields_after_llm(install_config, merged)
     merged = merge_rust_harness_fields_after_llm(install_config, merged)
     merged = merge_php_harness_fields_after_llm(install_config, merged)
+    merged = merge_refined_with_draft(
+        install_config,
+        merged,
+        language=str(install_config.get("language") or "python"),
+    )
     return sanitize_install_config_for_docker(normalize_install_config(merged), repo_hint)
 
 
@@ -534,6 +579,107 @@ def build_install_config_llm(
     )
 
 
+def _test_cmd_weakened(before: str, after: str) -> bool:
+    b, a = before.strip(), after.strip()
+    if not a:
+        return True
+    if "|| true" in a.lower() and "|| true" not in b.lower():
+        return True
+    if "; exit 0" in a.lower() and "; exit 0" not in b.lower():
+        return True
+    return False
+
+
+def merge_refined_with_draft(
+    draft: dict[str, Any],
+    refined: dict[str, Any],
+    *,
+    language: str,
+) -> dict[str, Any]:
+    """Keep CI/heuristic install & test_cmd when LLM output weakens them."""
+    out = normalize_install_config({**draft, **refined})
+    lang = language.strip().lower()
+    for key in (
+        "install",
+        "test_cmd",
+        "pre_install",
+        "post_install",
+        "pip_packages",
+        "reqs_path",
+        "native_integration_setup",
+        "native_integration_build",
+        "native_integration_pytest_root",
+        "native_integration_repo_dir",
+    ):
+        if draft.get(key) is not None and not refined.get(key):
+            out[key] = draft[key]
+    tc_before = str(draft.get("test_cmd") or "")
+    tc_after = str(out.get("test_cmd") or "")
+    if tc_before and _test_cmd_weakened(tc_before, tc_after):
+        out["test_cmd"] = tc_before
+    if lang == "javascript" and "pytest" in tc_after.lower() and "jest" in tc_before.lower():
+        out["test_cmd"] = tc_before
+    if lang == "javascript" and "pytest" in tc_after.lower() and "vitest" in tc_before.lower():
+        out["test_cmd"] = tc_before
+    specs_d = draft.get("docker_specs") if isinstance(draft.get("docker_specs"), dict) else {}
+    specs_r = out.get("docker_specs") if isinstance(out.get("docker_specs"), dict) else {}
+    merged_specs = {**specs_r, **{k: v for k, v in specs_d.items() if v}}
+    if merged_specs:
+        out["docker_specs"] = merged_specs
+    if draft.get("_ci_excerpt"):
+        out["_ci_excerpt"] = draft["_ci_excerpt"]
+    return out
+
+
+def refine_install_config_llm(
+    draft: dict[str, Any],
+    repo: Path,
+    repo_id: str,
+    *,
+    language: str,
+    ci_draft: Any = None,
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout_s: int,
+) -> dict[str, Any]:
+    """LLM refines an existing draft (all languages); prefers CI over invention."""
+    from .ci_extract import CiExtractDraft, ci_excerpt_for_remediation
+
+    rels = llm_pick_install_files(
+        repo, repo_id, api_key=api_key, base_url=base_url, model=model, timeout_s=timeout_s
+    )
+    rendered = read_files_budget(repo, rels, max_chars=80_000)
+    excerpt = ""
+    if isinstance(ci_draft, CiExtractDraft):
+        excerpt = ci_excerpt_for_remediation(ci_draft)
+    elif draft.get("_ci_excerpt"):
+        excerpt = str(draft["_ci_excerpt"])[:8000]
+
+    tpl = load_prompt("refine_install_recipe.txt")
+    user = (
+        tpl.replace("{{repo_name}}", repo_id)
+        .replace("{{language}}", language)
+        .replace("{{draft_config}}", json.dumps(draft, indent=2))
+        .replace("{{ci_excerpt}}", excerpt or "(none)")
+        .replace("{{rendered}}", rendered)
+    )
+    raw = chat_completions(
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        system="Return only a single valid JSON object matching the draft schema. No markdown.",
+        user=user,
+        timeout_s=timeout_s,
+        json_object=True,
+    )
+    obj = extract_json_object(raw)
+    if not isinstance(obj, dict):
+        raise ValueError("Refine recipe model output is not a JSON object")
+    merged = merge_refined_with_draft(draft, obj, language=language)
+    return sanitize_install_config_for_docker(merged, repo_id, repo=repo)
+
+
 def default_install_config_heuristic(repo: Path, language: str = "python") -> dict[str, Any]:
     """Minimal recipe when no LLM key is available (Docker-replayable)."""
     from .languages import detect_language_from_repo, get_language_spec, normalize_language
@@ -548,6 +694,9 @@ def default_install_config_heuristic(repo: Path, language: str = "python") -> di
     if lang == "python":
         has_py = (repo / "pyproject.toml").is_file() or (repo / "setup.py").is_file()
         cfg["install"] = "pip install -e ." if has_py else "pip install ."
+        from .integration_build import apply_native_build_if_integration
+
+        cfg = apply_native_build_if_integration(cfg, repo)
     elif lang == "java":
         from .java_build import java_install_config_for_repo
 
@@ -562,6 +711,13 @@ def default_install_config_heuristic(repo: Path, language: str = "python") -> di
         from .c_build import ensure_c_install_config
 
         cfg = ensure_c_install_config(cfg, repo=repo)
+        if repo is not None:
+            from .integration_build import apply_native_build_if_integration
+
+            cfg = apply_native_build_if_integration(cfg, repo)
+            from .apt_from_log import sanitize_native_integration_apt_config
+
+            cfg = sanitize_native_integration_apt_config(cfg)
     elif lang == "ruby":
         from .ruby_build import ruby_install_config_for_repo
 

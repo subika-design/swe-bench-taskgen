@@ -93,9 +93,14 @@ def preflight_pr(
         return PreflightResult(pr=pr, passed=False, blockers=[f"Could not fetch PR diff: {e}"])
 
     patch, test_patch = split_impl_and_test_patch(diff, repo_id=pr.repo_id)
+    root_names = _repo_root_names(pr.owner, pr.repo)
     lang = language.strip().lower()
     if lang == "auto":
-        lang = detect_language_from_patches(patch, test_patch) or "python"
+        lang = (
+            detect_language_from_patches("", test_patch)
+            or detect_language_from_patches(patch, test_patch)
+            or ("c" if "CMakeLists.txt" in root_names else "python")
+        )
     else:
         lang = normalize_language(lang)
 
@@ -105,7 +110,6 @@ def preflight_pr(
 
     # Scan diff + a few root files for hard markers
     marker_hits = _scan_text_for_hard_markers(diff)
-    root_names = _repo_root_names(pr.owner, pr.repo)
     if "package.json" in root_names:
         try:
             import base64

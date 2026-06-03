@@ -15,6 +15,17 @@ from .apt_from_log import (
 _CMAKE_BASE_APT = ("cmake",)
 _PREMAKE_BASE_APT = ("uuid-dev",)
 _C_COMMON_APT = ("git", "build-essential", "pkg-config")
+_CMAKE_FIND_PACKAGE_RE = re.compile(r"find_package\s*\(\s*([A-Za-z0-9_+\-.]+)", re.IGNORECASE)
+_CMAKE_PKG_CHECK_RE = re.compile(r"pkg_check_modules\s*\([^)]*\b([A-Za-z0-9_+\-.]+)\b", re.IGNORECASE)
+_CMAKE_PACKAGE_APT: dict[str, tuple[str, ...]] = {
+    "openssl": ("libssl-dev",),
+    "libpsl": ("libpsl-dev",),
+    "nghttp2": ("libnghttp2-dev",),
+    "libidn2": ("libidn2-dev",),
+    "brotli": ("libbrotli-dev",),
+    "zstd": ("libzstd-dev",),
+    "zlib": ("zlib1g-dev",),
+}
 _PREMAKE_DECLARE_RE = re.compile(
     r"""test\.declare\s*\(\s*["']([^"']+)["']\s*\)""",
 )
@@ -220,11 +231,58 @@ def _base_apt_for_config(cfg: dict[str, Any], *, repo: Path | None = None) -> tu
     return _CMAKE_BASE_APT
 
 
+def _cmake_file_paths(repo: Path) -> list[Path]:
+    paths: list[Path] = []
+    root = repo / "CMakeLists.txt"
+    if root.is_file():
+        paths.append(root)
+    cmake_dir = repo / "CMake"
+    if cmake_dir.is_dir():
+        try:
+            for p in sorted(cmake_dir.rglob("*.cmake")):
+                if p.is_file():
+                    paths.append(p)
+                if len(paths) >= 200:
+                    break
+        except OSError:
+            pass
+    return paths
+
+
+def cmake_apt_packages_for_repo(repo: Path) -> list[str]:
+    """Best-effort apt preseed from CMake package declarations."""
+    if not (repo / "CMakeLists.txt").is_file():
+        return []
+    seen: set[str] = set()
+    inferred: list[str] = []
+    for path in _cmake_file_paths(repo):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        names = [m.group(1) for m in _CMAKE_FIND_PACKAGE_RE.finditer(text)]
+        names.extend(m.group(1) for m in _CMAKE_PKG_CHECK_RE.finditer(text))
+        for raw in names:
+            name = str(raw or "").strip().lower()
+            if not name:
+                continue
+            for needle, pkgs in _CMAKE_PACKAGE_APT.items():
+                if needle in name:
+                    for pkg in pkgs:
+                        if pkg not in seen:
+                            seen.add(pkg)
+                            inferred.append(pkg)
+    return inferred
+
+
 def ensure_c_base_pre_install(cfg: dict[str, Any], *, repo: Path | None = None) -> dict[str, Any]:
     """Ensure C projects have build tools in pre_install."""
     out = remediate_apt_install_from_log(dict(cfg), "")
     out = merge_apt_into_config(out, list(_C_COMMON_APT))
-    return merge_apt_into_config(out, list(_base_apt_for_config(out, repo=repo)))
+    out = merge_apt_into_config(out, list(_base_apt_for_config(out, repo=repo)))
+    if repo is not None and not is_premake_config(out, repo=repo):
+        out = merge_apt_into_config(out, cmake_apt_packages_for_repo(repo))
+    return out
 
 
 def remediate_c_install_from_log(

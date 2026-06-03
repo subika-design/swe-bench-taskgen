@@ -94,6 +94,40 @@ def parse_gradle_harness_log(log: str) -> dict[str, str]:
     return out
 
 
+def parse_rspec_log(log: str) -> dict[str, str]:
+    """
+    Parse RSpec-style lines into ``path::example`` keys matching discover JUnit node ids.
+
+    Handles explicit ``PASSED|FAILED path::name`` lines and classic RSpec failure summaries.
+    """
+    out: dict[str, str] = {}
+    explicit = re.compile(r"^(PASSED|FAILED|ERROR)\s+(\S+?::.+)$", re.I)
+    for line in log.splitlines():
+        m = explicit.match(line.strip())
+        if m:
+            status, key = m.group(1).upper(), m.group(2)
+            if status == "PASSED":
+                out[key] = PASSED
+            elif status in ("FAILED", "ERROR"):
+                out[key] = FAILED
+            continue
+        if " Failure" in line or line.strip().startswith("Failed examples:"):
+            continue
+        # ``rspec ./spec/foo_spec.rb:12 # Group example name``
+        m2 = re.search(
+            r"rspec\s+(\./)?(\S+_spec\.rb):\d+\s+#\s+(.+)$",
+            line.strip(),
+            re.I,
+        )
+        if m2:
+            rel = m2.group(2).lstrip("./")
+            name = m2.group(3).strip()
+            key = f"{rel}::{name}"
+            if key not in out:
+                out[key] = FAILED
+    return out
+
+
 def parse_googletest_log(log: str) -> dict[str, str]:
     """Parse GoogleTest-style lines (Premake self-test, fmtlib, etc.)."""
     out: dict[str, str] = {}
@@ -121,4 +155,6 @@ def parse_log_for_language(log: str, result_format: str) -> dict[str, str]:
         return parse_gradle_harness_log(log)
     if result_format == "googletest_log":
         return parse_googletest_log(log)
+    if result_format == "rspec_log":
+        return parse_rspec_log(log)
     return {}

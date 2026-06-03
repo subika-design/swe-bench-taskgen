@@ -470,14 +470,135 @@ def _repo_has_jest_config(repo: Path, test_paths: list[str] | None = None) -> st
     return discover_jest_config_path(repo, test_paths) or ""
 
 
+def ci_test_cmd_uses_jest(test_cmd: str) -> bool:
+    """True when ``test_cmd`` runs Jest (not merely a repo that lists jest in devDeps)."""
+    low = (test_cmd or "").lower()
+    if "jest" not in low:
+        return False
+    return bool(
+        re.search(r"\bnpx\s+jest\b", low)
+        or re.search(r"\bjest\s+--", low)
+        or ("npm test" in low and "jest" in low)
+    )
+
+
+def ci_test_cmd_uses_mocha_or_makefile(test_cmd: str) -> bool:
+    """True for ``node Makefile mocha``, ``npx mocha``, etc."""
+    low = (test_cmd or "").lower()
+    if re.search(r"\bnode\s+Makefile(?:\.js)?\b", low) and "mocha" in low:
+        return True
+    if re.search(r"\bnpx\s+mocha\b|\b_mocha\b", low) and "jest" not in low.split("&&")[0]:
+        return True
+    return False
+
+
+def log_indicates_jest_haste_map_failure(log_tail: str) -> bool:
+    """Jest died in haste-map before tests (common in repos with broken fixture package.json)."""
+    low = (log_tail or "").lower()
+    return (
+        "jest-haste-map" in low
+        or "haste module naming collision" in low
+        or ("cannot parse" in low and "package.json as json" in low)
+    )
+
+
+def makefile_ci_test_cmd(repo: Path, *, repo_dir: str = "/testbed") -> str:
+    """CI-style ``node Makefile.js mocha`` when the repo uses shelljs make targets."""
+    from .repo_detect import repo_makefile_path
+
+    mf = repo_makefile_path(repo)
+    if mf is None:
+        return ""
+    return f"cd {repo_dir} && node {mf.name} mocha"
+
+
+def makefile_mocha_test_cmd_from_targets(
+    test_paths: list[str],
+    *,
+    repo_dir: str = "/testbed",
+    repo: Path | None = None,
+) -> str:
+    """Scoped Mocha (+ optional c8) aligned with Makefile.js conventions (eslint class)."""
+    from .repo_detect import (
+        makefile_text,
+        makefile_uses_c8_with_mocha,
+        repo_makefile_path,
+    )
+
+    paths = _filter_js_targets(test_paths)
+    if not paths:
+        return makefile_ci_test_cmd(repo, repo_dir=repo_dir) if repo else ""
+
+    timeout = "10000"
+    if repo is not None:
+        text = makefile_text(repo)
+        m = re.search(
+            r"MOCHA_TIMEOUT\s*=\s*parseInt\([^,]+,\s*10\)\s*\|\|\s*(\d+)",
+            text,
+        )
+        if m:
+            timeout = m.group(1)
+
+    require_hook = resolve_mocha_require_hook(repo) if repo is not None else ""
+    junit = (
+        f"--reporter {MOCHA_JUNIT_REPORTER} "
+        f"--reporter-options mochaFile={JUNIT_OUT_PLACEHOLDER}"
+    )
+    quoted = " ".join(f'"{p}"' for p in paths[:40])
+    inner = (
+        f"npx mocha{require_hook} --forbid-only -t {timeout} {junit} {quoted}"
+    ).strip()
+    cmd = f"cd {repo_dir} && "
+    if repo is not None and makefile_uses_c8_with_mocha(repo):
+        cmd += f"npx c8 -- {inner}"
+    else:
+        cmd += inner
+    if repo is not None and not repo_makefile_path(repo):
+        return mocha_test_cmd_from_targets(paths, repo_dir=repo_dir, repo=repo)
+    return cmd
+
+
+def should_scope_with_jest(
+    cfg: dict[str, Any],
+    repo: Path,
+    test_paths: list[str],
+    *,
+    runner: JsTestRunner,
+) -> bool:
+    """Only replace CI ``test_cmd`` with scoped ``npx jest`` when Jest is the real runner."""
+    if runner != "jest":
+        return False
+    tc = str(cfg.get("test_cmd") or "").strip()
+    if tc and ci_test_cmd_uses_mocha_or_makefile(tc) and not ci_test_cmd_uses_jest(tc):
+        return False
+    from .repo_detect import repo_has_jest_haste_fixture_risk
+
+    if repo_has_jest_haste_fixture_risk(repo) and not _repo_has_jest_config(
+        repo, test_paths
+    ):
+        return False
+    if tc and not ci_test_cmd_uses_jest(tc) and not _repo_has_jest_config(repo, test_paths):
+        return False
+    return True
+
+
 def detect_js_test_runner(repo: Path, test_paths: list[str] | None = None) -> JsTestRunner:
     """
     Detect whether the repo's primary test runner is Vitest, Jest, or Mocha.
 
     Vitest repos (e.g. axios) expose ``vitest`` in devDependencies and route
     ``npm test`` through ``vitest run``; Jest repos use ``jest`` / jest-junit.
-    Mocha repos (e.g. style-dictionary node tests) use ``test:node`` with ESM hooks.
+    Mocha repos (e.g. style-dictionary, eslint Makefile.js) use Mocha or ``test:node``.
     """
+    from .repo_detect import (
+        makefile_has_mocha_target,
+        repo_has_jest_haste_fixture_risk,
+        repo_uses_makefile_test,
+    )
+
+    if repo_uses_makefile_test(repo) and makefile_has_mocha_target(repo):
+        return "mocha"
+
     data = load_package_json(repo)
     if not data:
         return "jest"
@@ -513,6 +634,12 @@ def detect_js_test_runner(repo: Path, test_paths: list[str] | None = None) -> Js
         return "vitest" if vitest_in_test or not jest_in_test else "jest"
     if has_vitest and not has_jest:
         return "vitest"
+    if has_mocha and not has_jest and repo_has_jest_haste_fixture_risk(repo):
+        return "mocha"
+    if has_mocha and not has_jest and re.search(
+        r"\bnode\s+Makefile(?:\.js)?\b", test_script, re.I
+    ):
+        return "mocha"
     return "jest"
 
 
@@ -680,6 +807,13 @@ def mocha_test_cmd_from_targets(
     repo: Path | None = None,
 ) -> str:
     """Scoped ``mocha`` on diff / test_patch paths with JUnit output."""
+    if repo is not None:
+        from .repo_detect import makefile_has_mocha_target, repo_uses_makefile_test
+
+        if repo_uses_makefile_test(repo) and makefile_has_mocha_target(repo):
+            return makefile_mocha_test_cmd_from_targets(
+                test_paths, repo_dir=repo_dir, repo=repo
+            )
     paths = _filter_js_targets(test_paths)
     require_hook = resolve_mocha_require_hook(repo) if repo is not None else ""
     junit = (
@@ -707,6 +841,13 @@ def jest_test_cmd_from_targets(
 ) -> str:
     """Jest or full ``npm run test`` (nps) for diff / test_patch paths."""
     paths = _filter_js_targets(test_paths)
+    if repo is not None:
+        from .repo_detect import repo_has_jest_haste_fixture_risk
+
+        if repo_has_jest_haste_fixture_risk(repo) and not _repo_has_jest_config(
+            repo, paths or test_paths
+        ):
+            return mocha_test_cmd_from_targets(paths, repo_dir=repo_dir, repo=repo)
     jest_cfg = ""
     if repo is not None:
         cfg_name = _repo_has_jest_config(repo, paths or test_paths)
@@ -883,6 +1024,9 @@ def merge_js_build_into_config(
 ) -> dict[str, Any]:
     """Apply JS heuristics before Docker discover / image build."""
     runner = detect_js_test_runner(repo, test_paths)
+    tc_in = str(cfg.get("test_cmd") or "").strip()
+    if tc_in and ci_test_cmd_uses_mocha_or_makefile(tc_in) and not ci_test_cmd_uses_jest(tc_in):
+        runner = "mocha"
     base = js_install_config_for_repo(repo, base=cfg, test_paths=test_paths)
     out = dict(cfg)
     out["js_test_runner"] = runner
@@ -896,16 +1040,32 @@ def merge_js_build_into_config(
         if key in base and base[key]:
             out[key] = base[key]
     scoped_paths = _filter_js_targets([p for p in test_paths if isinstance(p, str) and p.strip()])
+    preserved_ci = (
+        tc_in
+        and ci_test_cmd_uses_mocha_or_makefile(tc_in)
+        and not ci_test_cmd_uses_jest(tc_in)
+        and not scoped_paths
+    )
     if scoped_paths:
-        out["test_cmd"] = js_test_cmd_from_targets(
-            scoped_paths, repo_dir=repo_dir, repo=repo, runner=runner
-        )
+        if should_scope_with_jest(out, repo, scoped_paths, runner=runner):
+            out["test_cmd"] = js_test_cmd_from_targets(
+                scoped_paths, repo_dir=repo_dir, repo=repo, runner=runner
+            )
+        else:
+            out["test_cmd"] = js_test_cmd_from_targets(
+                scoped_paths, repo_dir=repo_dir, repo=repo, runner=runner
+            )
+    elif preserved_ci:
+        out["test_cmd"] = normalize_js_test_cmd(tc_in, runner=runner)
     elif not str(out.get("test_cmd") or "").strip() or str(out.get("test_cmd", "")).startswith(
         "pytest"
     ):
         out["test_cmd"] = js_test_cmd_from_targets([], repo_dir=repo_dir, repo=repo, runner=runner)
+    elif tc_in and runner == "mocha" and not ci_test_cmd_uses_jest(tc_in):
+        out["test_cmd"] = normalize_js_test_cmd(tc_in, runner=runner)
     else:
-        out["test_cmd"] = normalize_js_test_cmd(str(out["test_cmd"]), runner=runner)
+        out["test_cmd"] = normalize_js_test_cmd(str(out.get("test_cmd") or tc_in), runner=runner)
+    out["js_test_runner"] = runner
     return ensure_js_docker_specs(
         ensure_js_post_install(out, runner),
         repo=repo,
@@ -965,15 +1125,56 @@ def augment_javascript_snapshot_permissions(cfg: dict[str, Any]) -> dict[str, An
     return out
 
 
+def remediate_js_jest_haste_to_mocha(
+    cfg: dict[str, Any],
+    repo: Path,
+    test_paths: list[str] | None = None,
+    *,
+    repo_dir: str = "/testbed",
+) -> dict[str, Any]:
+    """Switch from scoped Jest to Mocha when haste-map dies on fixture package.json trees."""
+    from .repo_detect import makefile_has_mocha_target, repo_uses_makefile_test
+
+    out = dict(cfg)
+    out["js_test_runner"] = "mocha"
+    paths = [p for p in (test_paths or []) if isinstance(p, str) and p.strip()]
+    if paths:
+        if repo_uses_makefile_test(repo) and makefile_has_mocha_target(repo):
+            out["test_cmd"] = makefile_mocha_test_cmd_from_targets(
+                paths, repo_dir=repo_dir, repo=repo
+            )
+        else:
+            out["test_cmd"] = mocha_test_cmd_from_targets(
+                paths, repo_dir=repo_dir, repo=repo
+            )
+    else:
+        cmd = makefile_ci_test_cmd(repo, repo_dir=repo_dir)
+        out["test_cmd"] = cmd or mocha_test_cmd_from_targets([], repo_dir=repo_dir, repo=repo)
+    out["test_cmd"] = normalize_js_test_cmd(str(out["test_cmd"]), runner="mocha")
+    return ensure_js_docker_specs(
+        ensure_js_post_install(out, "mocha"),
+        repo=repo,
+        language="javascript",
+    )
+
+
 def remediate_js_install_from_log(
     cfg: dict[str, Any],
     log_tail: str,
     *,
     repo: Path | None = None,
+    test_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     """Heuristic install fixes for npm/yarn failures seen in Docker discover logs."""
     out = dict(cfg)
     low = (log_tail or "").lower()
+    if repo is not None and log_indicates_jest_haste_map_failure(log_tail):
+        from .repo_detect import makefile_has_mocha_target
+
+        if makefile_has_mocha_target(repo) or str(out.get("js_test_runner") or "") == "jest":
+            return remediate_js_jest_haste_to_mocha(
+                out, repo, test_paths=test_paths
+            )
     if "eacces" in low and ("snapshot" in low or "__snapshots__" in low):
         out = augment_javascript_snapshot_permissions(out)
     specs = dict(out.get("docker_specs") or {}) if isinstance(out.get("docker_specs"), dict) else {}

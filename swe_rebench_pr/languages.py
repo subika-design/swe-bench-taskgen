@@ -402,6 +402,8 @@ def detect_language_from_repo_build_markers(repo: Path) -> str | None:
         return "php"
     if (repo / "Gemfile").is_file():
         return "ruby"
+    if (repo / "CMakeLists.txt").is_file():
+        return "c"
     # Python before package.json — Django and many Python repos ship a root package.json for JS tooling.
     if (repo / "pyproject.toml").is_file() or (repo / "setup.py").is_file() or (repo / "setup.cfg").is_file():
         return "python"

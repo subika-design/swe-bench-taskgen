@@ -88,6 +88,10 @@ def install_config_to_harness_specs(
             if deb:
                 specs["apt-pkgs"] = deb
 
+    optional = install_config.get("apt-pkgs-optional")
+    if isinstance(optional, list) and optional:
+        specs["apt-pkgs-optional"] = [str(p) for p in optional if str(p).strip()]
+
     return specs
 
 

@@ -14,7 +14,7 @@ Given a text file of PR links (one per line), the pipeline:
 2. **Splits the PR diff** into:
   - `patch` — production/source changes
   - `test_patch` — test-only changes (heuristics + optional LLM)
-3. **Builds an install recipe** (`install_config`) — how to install deps and run tests in Docker (LLM + prompts, with heuristics as fallback).
+3. **Builds an install recipe** (`install_config`) — CI/workflows + manifests + language heuristics, optional LLM refine, per-repo cache (`~/.cache/swe_rebench_pr/install_config` or `SWE_REBENCH_INSTALL_CACHE`).
 4. **Runs tests in Docker** (default) — clones the repo at `base_commit`, installs, runs tests, applies patches, runs again, and fills `FAIL_TO_PASS` / `PASS_TO_PASS`.
 5. **Writes one JSON object per line** to your output file — only rows that pass quality checks (`task_type` is `valid` or `partially_valid`).
 
@@ -236,9 +236,10 @@ Templates live in `prompts/`:
 | File                             | Role                                       |
 | -------------------------------- | ------------------------------------------ |
 | `list_install_files.txt`         | Pick install-related paths in the repo     |
-| `extract_install_recipe.txt`     | Build `install_config` JSON                |
+| `extract_install_recipe.txt`     | Build `install_config` JSON (legacy Python) |
+| `refine_install_recipe.txt`      | Refine CI/heuristic draft (all languages)  |
 | `fix_install_recipe.txt`         | Repair install from failure logs           |
-| `fix_install_from_tests.txt`     | Install fixes from test output             |
+| `fix_install_from_tests.txt`     | Install fixes from test output (+ CI ctx)  |
 | `create_test_patch_from_pr.txt`  | Generate `test_patch` when PR has no tests |
 | `fix_test_patch_from_tests.txt`  | Fix failing test patch                     |
 | `fix_test_patch_apply_check.txt` | Fix patch that fails `git apply --check`   |

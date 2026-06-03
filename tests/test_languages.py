@@ -108,6 +108,22 @@ def test_detect_language_python_before_package_json(tmp_path: Path):
     assert detect_language_from_repo_build_markers(tmp_path) == "python"
 
 
+def test_detect_language_from_repo_build_markers_cmake(tmp_path: Path):
+    (tmp_path / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n", encoding="utf-8")
+    assert detect_language_from_repo_build_markers(tmp_path) == "c"
+
+
+def test_resolve_task_language_cmake_pytest_hybrid_is_c(tmp_path: Path):
+    (tmp_path / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n", encoding="utf-8")
+    http = tmp_path / "tests" / "http"
+    http.mkdir(parents=True)
+    (http / "conftest.py").write_text("", encoding="utf-8")
+    patch = "diff --git a/lib/foo.c b/lib/foo.c\n"
+    test_patch = "diff --git a/tests/http/test_foo.py b/tests/http/test_foo.py\n"
+    assert resolve_task_language("auto", repo=tmp_path, patch=patch, test_patch=test_patch) == "c"
+    assert resolve_task_language("c", repo=tmp_path, patch=patch, test_patch=test_patch) == "c"
+
+
 def test_resolve_task_language_django_repo_id():
     assert (
         resolve_task_language("auto", repo_id="django/django", patch="", test_patch="")

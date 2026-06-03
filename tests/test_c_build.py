@@ -4,6 +4,7 @@ from pathlib import Path
 
 from swe_rebench_pr.c_build import (
     apt_packages_from_c_build_log,
+    cmake_apt_packages_for_repo,
     ensure_c_install_config,
     merge_c_apt_into_config,
     merge_c_harness_fields_after_llm,
@@ -61,6 +62,24 @@ def test_ensure_c_install_config_from_repo(tmp_path: Path):
     pre = " ".join(out.get("pre_install") or [])
     assert "cmake" in pre
     assert "build-essential" in pre
+
+
+def test_cmake_apt_packages_for_repo_find_package_scan(tmp_path: Path):
+    (tmp_path / "CMakeLists.txt").write_text(
+        "\n".join(
+            [
+                "cmake_minimum_required(VERSION 3.18)",
+                "find_package(OpenSSL REQUIRED)",
+                "find_package(Libpsl REQUIRED)",
+                "find_package(Zstd REQUIRED)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    pkgs = cmake_apt_packages_for_repo(tmp_path)
+    assert "libssl-dev" in pkgs
+    assert "libpsl-dev" in pkgs
+    assert "libzstd-dev" in pkgs
 
 
 def test_ensure_c_install_config_premake_repo(tmp_path: Path):

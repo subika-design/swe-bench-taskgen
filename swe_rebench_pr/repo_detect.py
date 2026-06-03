@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -204,6 +205,80 @@ def discover_javascript_snapshot_dirs(repo: Path) -> list[str]:
 def repo_has_javascript_snapshots(repo: Path) -> bool:
     """True when any ``__snapshots__`` tree exists (Jest/Mocha/web-test-runner)."""
     return bool(discover_javascript_snapshot_dirs(repo))
+
+
+_MAKEFILE_NAMES = ("Makefile.js", "Makefile")
+
+
+def repo_makefile_path(repo: Path) -> Path | None:
+    """Return ``Makefile.js`` or ``Makefile`` when the repo uses shelljs/make targets."""
+    for name in _MAKEFILE_NAMES:
+        p = repo / name
+        if p.is_file():
+            return p
+    return None
+
+
+def _package_json_test_script(repo: Path) -> str:
+    pkg = repo / "package.json"
+    if not pkg.is_file():
+        return ""
+    try:
+        data = json.loads(_read_repo_text(pkg, max_bytes=200_000))
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    scripts = data.get("scripts") if isinstance(data.get("scripts"), dict) else {}
+    return str(scripts.get("test") or "")
+
+
+def repo_uses_makefile_test(repo: Path) -> bool:
+    """True when ``npm test`` / CI invokes ``node Makefile[.js]`` (eslint, etc.)."""
+    test = _package_json_test_script(repo)
+    if re.search(r"\bnode\s+Makefile(?:\.js)?\b", test, re.I):
+        return True
+    return repo_makefile_path(repo) is not None and bool(test.strip())
+
+
+def makefile_text(repo: Path) -> str:
+    path = repo_makefile_path(repo)
+    return _read_repo_text(path) if path else ""
+
+
+def makefile_has_mocha_target(repo: Path) -> bool:
+    """True when the Makefile defines a Mocha unit-test target (``target.mocha``)."""
+    text = makefile_text(repo)
+    if not text:
+        return False
+    if re.search(r"target\.mocha\s*=", text):
+        return True
+    return "MOCHA" in text and ("_mocha" in text or "mocha/bin" in text)
+
+
+def makefile_uses_c8_with_mocha(repo: Path) -> bool:
+    text = makefile_text(repo)
+    return bool(text) and "c8" in text and "MOCHA" in text
+
+
+def repo_has_jest_haste_fixture_risk(repo: Path, *, min_fixture_pkg_json: int = 3) -> bool:
+    """
+    Repos like eslint keep intentionally invalid ``package.json`` under ``tests/fixtures``.
+
+    Scoped ``npx jest`` still runs haste-map over the tree and fails before tests run.
+    """
+    for root_name in ("tests/fixtures", "test/fixtures"):
+        fixtures = repo.joinpath(*root_name.split("/"))
+        if not fixtures.is_dir():
+            continue
+        count = 0
+        try:
+            for p in fixtures.rglob("package.json"):
+                if p.is_file():
+                    count += 1
+                    if count >= min_fixture_pkg_json:
+                        return True
+        except OSError:
+            continue
+    return False
 
 
 def repo_uses_mocha_with_snapshots(repo: Path) -> bool:

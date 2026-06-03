@@ -10,12 +10,8 @@ from typing import Any, Optional
 from .diff_split import split_impl_and_test_patch
 from .docker_discover import discover_fail_to_pass_pass_to_pass_docker
 from .gh_pr import ParsedPR, clone_repo_at, fetch_pr_diff, fetch_pr_metadata
-from .install_llm import (
-    build_install_config_llm,
-    default_install_config_heuristic,
-    llm_fix_recipe,
-    sanitize_install_config_for_docker,
-)
+from .install_config_build import build_install_config_for_repo
+from .install_llm import llm_fix_recipe
 from .env_setup import try_pip_install_and_freeze
 from .issues import build_problem_and_hints
 from .schema import OUTPUT_KEYS
@@ -44,6 +40,21 @@ def resolve_task_language(
 
         if uses_django_runtests(repo=repo, repo_id=repo_id):
             return "python"
+        if repo is not None:
+            from .integration_build import resolve_integration_task_language
+
+            integration_lang = resolve_integration_task_language(
+                repo, patch=patch, test_patch=test_patch
+            )
+            if integration_lang:
+                return integration_lang
+        # Prefer test_patch signal over implementation paths in hybrid repos.
+        from_test_patch = detect_language_from_patches("", test_patch)
+        if from_test_patch:
+            return from_test_patch
+        from_test_changed = detect_language_from_changed_paths("", test_patch)
+        if from_test_changed:
+            return from_test_changed
         if repo is not None:
             from_build = detect_language_from_repo_build_markers(repo)
             if from_build:
@@ -124,34 +135,27 @@ def build_row(
         task_language = resolve_task_language(
             language, repo=repo, patch=patch, test_patch=test_patch, repo_id=pr.repo_id
         )
-        install_cfg = dict(get_language_spec(task_language).default_install_config)
-        version = normalized_install_version(repo, meta.base_commit)
-        if llm_install is not None and task_language == "python":
-            api_key, base_url, model, to = llm_install
-            try:
-                install_cfg = build_install_config_llm(
-                    repo, pr.repo_id, api_key=api_key, base_url=base_url, model=model, timeout_s=to
-                )
-            except Exception as e:
-                print(f"  {pr.instance_id}: install LLM failed ({e}); heuristic install_config", file=sys.stderr)
-                install_cfg = default_install_config_heuristic(repo, task_language)
-        else:
-            install_cfg = default_install_config_heuristic(repo, task_language)
+        from .languages import collect_test_targets
 
-        if task_language == "java":
-            from .java_build import merge_java_build_into_config
-            from .languages import collect_test_targets
+        if task_language == "c":
+            from .integration_build import merge_hybrid_c_integration_paths
 
-            install_cfg = merge_java_build_into_config(
-                install_cfg,
-                repo,
-                collect_test_targets(task_language, patch, test_patch),
-                llm=llm_install,
-                repo_id=pr.repo_id,
-                instance_id=pr.instance_id,
+            test_paths, _runner = merge_hybrid_c_integration_paths(
+                patch, test_patch, language=task_language
             )
-
-        install_cfg = sanitize_install_config_for_docker(install_cfg, pr.repo_id, repo=repo)
+        else:
+            test_paths = collect_test_targets(task_language, patch, test_patch)
+        version = normalized_install_version(repo, meta.base_commit)
+        install_cfg = build_install_config_for_repo(
+            repo,
+            task_language,
+            pr.repo_id,
+            test_paths=test_paths,
+            llm_install=llm_install,
+            patch=patch,
+            test_patch=test_patch,
+            instance_id=pr.instance_id,
+        )
         version = harness_version_for_instance(pr.instance_id, task_language, version)
         from .swebench_align import export_install_config_for_harness
 

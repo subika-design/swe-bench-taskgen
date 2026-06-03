@@ -9,7 +9,7 @@ from swe_rebench_pr.swebench_align import canonicalize_java_gradle_test_maps
 def test_f2p_when_absent_at_base_passing_after_patch():
     base_map: dict[str, str] = {}
     patch_map = {"com.example.FooTests > bar": "PASSED"}
-    f2p, p2p = _compute_f2p_p2p(base_map, patch_map, Path("/tmp"), "java")
+    f2p, p2p, _stats = _compute_f2p_p2p(base_map, patch_map, Path("/tmp"), "java")
     assert f2p == ["com.example.FooTests > bar"]
     assert p2p == []
 
@@ -17,7 +17,7 @@ def test_f2p_when_absent_at_base_passing_after_patch():
 def test_f2p_when_failed_at_base_passing_after_patch():
     base_map = {"com.example.FooTests > bar": "FAILED"}
     patch_map = {"com.example.FooTests > bar": "PASSED"}
-    f2p, p2p = _compute_f2p_p2p(base_map, patch_map, Path("/tmp"), "java")
+    f2p, p2p, _stats = _compute_f2p_p2p(base_map, patch_map, Path("/tmp"), "java")
     assert f2p == ["com.example.FooTests > bar"]
     assert p2p == []
 
@@ -27,18 +27,29 @@ def test_f2p_vitest_style_nodeid_with_spaces_in_name():
     key = "tests/foo.test.ts::suite > should work"
     base_map = {key: "FAILED"}
     patch_map = {key: "PASSED"}
-    f2p, p2p = _compute_f2p_p2p(base_map, patch_map, Path("/tmp"), "javascript")
+    f2p, p2p, _stats = _compute_f2p_p2p(base_map, patch_map, Path("/tmp"), "javascript")
     assert f2p == [key]
     assert p2p == []
+
+
+def test_f2p_rspec_style_nodeid_with_spaces_in_name():
+    key = "spec/cop/foo_spec.rb::registers an offense"
+    base_map = {key: "failure"}
+    patch_map = {key: "passed"}
+    f2p, p2p, stats = _compute_f2p_p2p(base_map, patch_map, Path("/tmp"), "ruby")
+    assert f2p == [key]
+    assert p2p == []
+    assert stats["cand_f2p"] == 1
 
 
 def test_p2p_only_when_passing_in_both_runs():
     key = "com.example.FooTests > bar"
     base_map = {key: "PASSED"}
     patch_map = {key: "PASSED"}
-    f2p, p2p = _compute_f2p_p2p(base_map, patch_map, Path("/tmp"), "java")
+    f2p, p2p, stats = _compute_f2p_p2p(base_map, patch_map, Path("/tmp"), "java")
     assert f2p == []
     assert p2p == [key]
+    assert stats["all_passed_both_phases"] == 1
 
 
 def test_canonicalize_does_not_cross_contaminate_phases():
@@ -50,6 +61,6 @@ def test_canonicalize_does_not_cross_contaminate_phases():
         {f"{cls} > method{i}": "passed" for i in range(1, 4)},
         patch_log,
     )
-    f2p, p2p = _compute_f2p_p2p(base_map, patch_map, Path("/tmp"), "java")
+    f2p, p2p, _stats = _compute_f2p_p2p(base_map, patch_map, Path("/tmp"), "java")
     assert len(f2p) == 3
     assert p2p == []

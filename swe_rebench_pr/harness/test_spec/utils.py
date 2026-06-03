@@ -57,18 +57,28 @@ def make_repo_script_list_common(
     return setup_commands
 
 
+def env_apt_setup_commands(specs: dict) -> list[str]:
+    """Debian packages for the harness env image (required + optional best-effort)."""
+    cmds: list[str] = []
+    apt_pkgs = specs.get("apt-pkgs") or []
+    optional = specs.get("apt-pkgs-optional") or []
+    if apt_pkgs or optional:
+        cmds.append("apt-get update -qq")
+    if apt_pkgs:
+        cmds.append(f"apt-get install -y --no-install-recommends {' '.join(apt_pkgs)}")
+    for pkg in optional:
+        cmds.append(
+            f"apt-get install -y --no-install-recommends {pkg} || true"
+        )
+    return cmds
+
+
 def make_env_script_list_common(instance, specs, env_name) -> list:
     """
     Creates the list of commands to set up the environment for testing.
     This is the setup script for the environment image.
     """
-    reqs_commands = []
-    if "apt-pkgs" in specs:
-        reqs_commands += [
-            "apt-get update",
-            f"apt-get install -y {' '.join(specs['apt-pkgs'])}",
-        ]
-    return reqs_commands
+    return env_apt_setup_commands(specs)
 
 
 def make_eval_script_list_common(

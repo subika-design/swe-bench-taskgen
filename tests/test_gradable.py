@@ -26,6 +26,18 @@ def test_javascript_gradable_allows_spaces_in_test_name():
     assert not swebench_gradable_nodeid("bad path.ts::x", language="javascript")
 
 
+def test_ruby_gradable_allows_spaces_in_example_name():
+    nid = "spec/rubocop/cop/style/foo_spec.rb::registers an offense"
+    assert swebench_gradable_nodeid(nid, language="ruby")
+    assert not swebench_gradable_nodeid("bad path.rb::x", language="ruby")
+    assert not swebench_gradable_nodeid("spec/has space/foo_spec.rb::ok", language="ruby")
+
+
+def test_ruby_minitest_gradable_allows_spaces():
+    nid = "test/models/user_test.rb::creates a valid user"
+    assert swebench_gradable_nodeid(nid, language="ruby")
+
+
 def test_filter_splits_gradable():
     kept, dropped = filter_swebench_gradable_nodeids(
         [

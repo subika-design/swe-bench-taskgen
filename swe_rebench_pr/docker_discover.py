@@ -54,6 +54,12 @@ from .gh_pr import ParsedPR, clone_repo_at, strip_mailbox_to_unified
 
 def _test_patch_only_targets(language: str, test_patch: str) -> list[str]:
     """Test paths from ``test_patch`` (language rules, then split heuristics)."""
+    if str(language or "").strip().lower() == "c":
+        from .integration_build import integration_pytest_paths_from_patches
+
+        int_paths = integration_pytest_paths_from_patches("", test_patch)
+        if int_paths:
+            return int_paths
     paths = collect_test_targets_from_test_patch(language, test_patch)
     if paths:
         return paths
@@ -152,7 +158,13 @@ def _llm_diagnostics_blob(
             fl, el, sl = django_fail_error_skip_messages_for_paths(patch_junit, tp_only)
         elif tp_only:
             fl, el, sl = junit_fail_error_skip_messages_for_paths(
-                patch_junit, repo_root, tp_only, language=diag_lang
+                patch_junit,
+                repo_root,
+                tp_only,
+                language=diag_lang,
+                native_integration_pytest_root=_native_integration_pytest_root(
+                    install_config or {}
+                ),
             )
         else:
             fl, el, sl = junit_fail_error_skip_messages_limited(
@@ -288,10 +300,56 @@ def _docker_install_failed(
             and "corrupt patch" not in log_tail.lower()
         ):
             return False
+        low = log_tail.lower()
+        native_integration = (
+            install_config is not None and install_config.get("native_integration_build")
+        )
+        if (
+            lang in ("python", "c")
+            and native_integration
+            and "[docker] integration pytest" in log_tail
+            and "patch apply check failed" not in low
+            and "patch apply failed" not in low
+            and "corrupt patch" not in low
+        ):
+            return False
         return True
     # runtests entry uses ``|| true``; empty parse is a discovery issue, not pip install.
     # JavaScript: empty JUnit is usually test_cmd/reporter — not install (unless docker exited).
     if lang == "javascript" and docker_exit == 0:
+        return False
+    # C harness may compile successfully but emit non-path-matching/empty JUnit.
+    # Treat this as discovery mismatch, not install failure, when docker run succeeded.
+    if (
+        lang == "c"
+        and docker_exit == 0
+        and n_targets > 0
+        and n_patch == 0
+        and not (install_config or {}).get("native_integration_build")
+    ):
+        return False
+    if (
+        lang == "go"
+        and docker_exit == 0
+        and n_targets > 0
+        and n_patch == 0
+    ):
+        return False
+    if (
+        lang == "ruby"
+        and docker_exit == 0
+        and n_targets > 0
+        and n_patch == 0
+    ):
+        return False
+    if (
+        lang in ("python", "c")
+        and docker_exit == 0
+        and n_targets > 0
+        and n_patch == 0
+        and install_config is not None
+        and install_config.get("native_integration_build")
+    ):
         return False
     if not django_runtests and n_targets > 0 and n_patch == 0:
         if gradle and log_indicates_gradle_build_ok(log_tail):
@@ -408,6 +466,20 @@ def _docker_install_config_effective(
         from .python_build import augment_python_install_config
 
         cfg = augment_python_install_config(cfg, repo=repo, repo_id=pr.repo_id)
+        from .integration_build import apply_native_build_if_integration
+
+        cfg = apply_native_build_if_integration(cfg, repo)
+        from .apt_from_log import sanitize_native_integration_apt_config
+
+        cfg = sanitize_native_integration_apt_config(cfg)
+    elif lang == "c" and repo is not None:
+        from .integration_build import apply_native_build_if_integration
+
+        cfg = apply_native_build_if_integration(cfg, repo)
+        from .apt_from_log import sanitize_native_integration_apt_config
+
+        cfg = sanitize_native_integration_apt_config(cfg)
+        cfg["language"] = "c"
     return cfg
 
 
@@ -442,11 +514,16 @@ def _effective_result_format(
     fmt = install_config.get("result_format")
     if isinstance(fmt, str) and fmt.strip():
         return fmt.strip()
+    if install_config.get("native_integration_build"):
+        return "junit"
     from .c_build import is_premake_config
 
     if is_premake_config(install_config):
         return "googletest_log"
     return None
+
+
+def _sh_single_quoted(s: str) -> str:
     """Wrap for bash single-quoted string (escape embedded quotes)."""
     return "'" + s.replace("'", "'\"'\"'") + "'"
 
@@ -523,12 +600,14 @@ def _compute_f2p_p2p(
     lang: str,
     *,
     django_runtests: bool = False,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], dict[str, int]]:
     """
     Classify fail→pass vs pass→pass.
 
     FAIL_TO_PASS: not passing (or absent) at base+test_patch, passing at test_patch+impl.
     PASS_TO_PASS: passing in both runs.
+
+    Third element is classification stats for discover logging.
     """
     cand_f2p: list[str] = []
     cand_p2p: list[str] = []
@@ -544,21 +623,36 @@ def _compute_f2p_p2p(
             cand_f2p.append(nid)
         else:
             cand_p2p.append(nid)
-    f2p, _ = filter_swebench_gradable_nodeids(
+    f2p, dropped_f2p = filter_swebench_gradable_nodeids(
         cand_f2p,
         repo_root,
         for_pass_to_pass=False,
         language=lang,
         django_runtests=django_runtests,
     )
-    p2p, _ = filter_swebench_gradable_nodeids(
+    p2p, dropped_p2p = filter_swebench_gradable_nodeids(
         cand_p2p,
         repo_root,
         for_pass_to_pass=True,
         language=lang,
         django_runtests=django_runtests,
     )
-    return f2p, p2p
+    stats = {
+        "cand_f2p": len(cand_f2p),
+        "cand_p2p": len(cand_p2p),
+        "dropped_f2p": len(dropped_f2p),
+        "dropped_p2p": len(dropped_p2p),
+        "all_passed_both_phases": len(cand_p2p) if not cand_f2p else 0,
+    }
+    if not cand_f2p and cand_p2p:
+        stats["all_passed_both_phases"] = len(cand_p2p)
+    return f2p, p2p, stats
+
+
+def _native_integration_pytest_root(cfg: dict[str, Any]) -> str:
+    if not cfg.get("native_integration_build"):
+        return ""
+    return str(cfg.get("native_integration_pytest_root") or "").strip().strip("/")
 
 
 def _filter_f2p_to_test_patch_scope(
@@ -567,6 +661,8 @@ def _filter_f2p_to_test_patch_scope(
     lang: str,
     *,
     django_runtests: bool = False,
+    native_integration_pytest_root: str = "",
+    test_patch: str = "",
 ) -> list[str]:
     """Keep only FAIL_TO_PASS node ids that belong to ``test_patch`` paths."""
     if not tp_only:
@@ -585,7 +681,9 @@ def _filter_f2p_to_test_patch_scope(
             dotted,
             java_fqcns,
             test_patch_paths=tp_only,
+            test_patch=test_patch,
             language=lang,
+            native_integration_pytest_root=native_integration_pytest_root,
         ):
             kept.append(nid)
     return kept
@@ -611,6 +709,7 @@ def _docker_pytest_attempt(
     pytest_targets: list[str],
     tp_only: list[str],
     targets: list[str],
+    test_patch: str,
     docker_timeout: int,
     docker_pip_freeze_after: bool,
     attempt_label: str,
@@ -624,6 +723,10 @@ def _docker_pytest_attempt(
 ) -> dict[str, Any]:
     """One Docker install + test run before/after patch (pytest or Django runtests)."""
     eff_cfg.setdefault("language", lang)
+    from .integration_build import discover_harness_language, native_integration_discover_active
+
+    harness_lang = discover_harness_language(lang, eff_cfg)
+    native_py = native_integration_discover_active(eff_cfg)
     django_rt = uses_runtests_test_cmd(eff_cfg) or bool(eff_cfg.get("django_runtests"))
     result_fmt = _effective_result_format(lang, eff_cfg, django_rt=django_rt)
     run_targets = paths_to_runtests_labels(pytest_targets) if django_rt else pytest_targets
@@ -634,7 +737,7 @@ def _docker_pytest_attempt(
     image, eff_cfg = build_discover_image(
         row,
         eff_cfg,
-        lang,
+        harness_lang,
         force_rebuild=force_rebuild_harness_images,
         llm_remediate=llm_remediate,
         remediation_max_rounds=remediation_max_rounds,
@@ -645,7 +748,7 @@ def _docker_pytest_attempt(
     result_fmt = _effective_result_format(lang, eff_cfg, django_rt=django_rt)
 
     if not build_instance_harness_images:
-        write_harness_setup_repo_script(work, row, eff_cfg, lang)
+        write_harness_setup_repo_script(work, row, eff_cfg, harness_lang)
 
     testbed_dir: Path | None = None
     if not build_instance_harness_images:
@@ -654,7 +757,7 @@ def _docker_pytest_attempt(
 
     write_entry_script(
         work,
-        lang,
+        harness_lang,
         run_targets,
         eff_cfg,
         run_pip_freeze=docker_pip_freeze_after,
@@ -706,9 +809,12 @@ def _docker_pytest_attempt(
     elif lang == "ruby":
         runner = "rspec"
     elif lang == "c":
-        from .c_build import is_premake_config
+        if native_py:
+            runner = "pytest (native integration)"
+        else:
+            from .c_build import is_premake_config
 
-        runner = "premake5 test" if is_premake_config(eff_cfg) else "ctest"
+            runner = "premake5 test" if is_premake_config(eff_cfg) else "ctest"
     else:
         runner = "pytest"
     harness_label = "harness-instance" if build_instance_harness_images else "harness-env"
@@ -753,11 +859,13 @@ def _docker_pytest_attempt(
     from .c_build import is_premake_config
 
     premake_two_phase = lang == "c" and is_premake_config(eff_cfg)
+    native_c_pytest = lang == "c" and bool(eff_cfg.get("native_integration_build"))
     two_phase_js = lang == "javascript"
-    two_phase_py = lang == "python"
+    two_phase_py = lang == "python" or native_c_pytest
     two_phase_rust = lang == "rust"
     two_phase_go = lang == "go"
     two_phase_php = lang == "php"
+    two_phase_ruby = lang == "ruby"
     two_phase = (
         java_gradle
         or premake_two_phase
@@ -766,6 +874,7 @@ def _docker_pytest_attempt(
         or two_phase_rust
         or two_phase_go
         or two_phase_php
+        or two_phase_ruby
     )
     before_label = "base+test_patch" if two_phase else "before patch"
     after_label = "test_patch+impl" if two_phase else "after patch"
@@ -798,6 +907,52 @@ def _docker_pytest_attempt(
                 f"  {pr.instance_id}: javascript test-patch.log tail:\n{patch_log[-4000:]}",
                 file=sys.stderr,
             )
+    if lang == "ruby" and n_patch == 0 and pytest_targets:
+        print(
+            f"  {pr.instance_id}: ruby junit empty — check bundle install, "
+            f"RspecJunitFormatter, and scoped spec paths. "
+            f"docker stderr/stdout tail:\n{_docker_log_tail_for_display(dstderr, dstdout, max_len=3000)}",
+            file=sys.stderr,
+        )
+        for log_name in ("test-base.log", "test-patch.log"):
+            log_path = work / log_name
+            if not log_path.is_file():
+                continue
+            try:
+                tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+            except OSError:
+                tail = ""
+            if tail.strip():
+                print(
+                    f"  {pr.instance_id}: ruby {log_name} tail:\n{tail}",
+                    file=sys.stderr,
+                )
+    if (
+        (lang == "python" or native_c_pytest)
+        and n_patch == 0
+        and pytest_targets
+        and eff_cfg.get("native_integration_build")
+    ):
+        for log_name in ("test-base.log", "test-patch.log"):
+            log_path = work / log_name
+            if not log_path.is_file():
+                continue
+            try:
+                tail = log_path.read_text(encoding="utf-8", errors="replace")[-5000:]
+            except OSError:
+                tail = ""
+            if tail.strip():
+                print(
+                    f"  {pr.instance_id}: integration {log_name} tail:\n{tail}",
+                    file=sys.stderr,
+                )
+        print(
+            f"  {pr.instance_id}: native integration junit empty — check testdeps, "
+            f"integration servers (cmake find_program), and pytest log. "
+            f"docker stderr/stdout tail:\n"
+            f"{_docker_log_tail_for_display(dstderr, dstdout, max_len=3000)}",
+            file=sys.stderr,
+        )
     base_map = parse_test_status_map(base_result, repo_root, lang, result_format=result_fmt)
     patch_map = parse_test_status_map(patch_result, repo_root, lang, result_format=result_fmt)
     if (
@@ -815,12 +970,17 @@ def _docker_pytest_attempt(
             patch_map, _read_phase_gradle_log(work, "patch")
         )
 
+    native_pytest_root = _native_integration_pytest_root(eff_cfg)
     if tp_only:
         if django_rt:
             pa, fa, ea, sk, tot = django_outcome_counts_for_paths(patch_map, tp_only)
         else:
             pa, fa, ea, sk, tot = junit_outcome_counts_for_paths(
-                patch_map, tp_only, language=lang
+                patch_map,
+                tp_only,
+                language=lang,
+                native_integration_pytest_root=native_pytest_root,
+                test_patch=test_patch,
             )
     else:
         pa, fa, ea, sk, tot = junit_outcome_counts_all(patch_map)
@@ -833,7 +993,12 @@ def _docker_pytest_attempt(
             fl, el, sl = django_fail_error_skip_messages_for_paths(patch_result, tp_only)
         elif get_language_spec(lang).result_format == "junit":
             fl, el, sl = junit_fail_error_skip_messages_for_paths(
-                patch_result, repo_root, tp_only, language=lang
+                patch_result,
+                repo_root,
+                tp_only,
+                language=lang,
+                native_integration_pytest_root=native_pytest_root,
+                test_patch=test_patch,
             )
     elif (fa or ea or sk) and get_language_spec(lang).result_format == "junit":
         fl, el, sl = junit_fail_error_skip_messages_limited(
@@ -847,6 +1012,10 @@ def _docker_pytest_attempt(
         elif tot == 0:
             if django_rt and patch_result.is_file() and patch_result.stat().st_size > 0:
                 extra = " (runtests log present but no cases matched test_patch labels)"
+            elif lang == "go" and patch_map:
+                extra = " (no gotest cases matched test_patch Test* names)"
+            elif lang == "ruby" and patch_map:
+                extra = " (no rspec junit cases matched test_patch *_spec.rb paths)"
             else:
                 extra = " (no junit cases matched test_patch paths)"
         print(
@@ -854,7 +1023,14 @@ def _docker_pytest_attempt(
             file=sys.stderr,
         )
         if tot == 0 and patch_map:
-            log_junit_test_patch_mismatch(pr.instance_id, patch_map, tp_only)
+            log_junit_test_patch_mismatch(
+                pr.instance_id,
+                patch_map,
+                tp_only,
+                native_integration_pytest_root=native_pytest_root,
+                test_patch=test_patch,
+                language=lang,
+            )
         if fa or ea or sk:
             _print_test_patch_junit_diagnostics(pr.instance_id, fl, el, sl)
     else:
@@ -876,8 +1052,9 @@ def _docker_pytest_attempt(
 
     f2p: list[str] = []
     p2p: list[str] = []
+    f2p_stats: dict[str, int] = {}
     if not install_failed and (n_patch > 0 or (django_rt and patch_map)):
-        f2p, p2p = _compute_f2p_p2p(
+        f2p, p2p, f2p_stats = _compute_f2p_p2p(
             base_map, patch_map, repo_root, lang, django_runtests=django_rt
         )
 
@@ -885,7 +1062,12 @@ def _docker_pytest_attempt(
         tp_only
         and patch_map
         and has_test_patch_label_mismatch(
-            patch_map, tp_only, django_runtests=django_rt, language=lang
+            patch_map,
+            tp_only,
+            django_runtests=django_rt,
+            language=lang,
+            native_integration_pytest_root=native_pytest_root,
+            test_patch=test_patch,
         )
     )
     after_patch_empty = bool(
@@ -895,6 +1077,7 @@ def _docker_pytest_attempt(
     return {
         "f2p": f2p,
         "p2p": p2p,
+        "f2p_stats": f2p_stats,
         "n_base": n_base,
         "n_patch": len(patch_map) if django_rt else n_patch,
         "pa": pa,
@@ -982,6 +1165,15 @@ def discover_fail_to_pass_pass_to_pass_docker(
 
     patch_has_tests = bool(collect_test_targets(lang, patch, ""))
     tp_collect = collect_test_targets_from_test_patch(lang, test_patch)
+    if lang == "c":
+        from .integration_build import integration_pytest_paths_from_patches
+
+        int_tp = integration_pytest_paths_from_patches(patch, test_patch)
+        if int_tp:
+            patch_has_tests = patch_has_tests or bool(
+                integration_pytest_paths_from_patches(patch, "")
+            )
+            tp_collect = int_tp
     tp_heuristic = collect_heuristic_test_paths_from_patch(test_patch)
     if (
         llm_remediate
@@ -998,6 +1190,14 @@ def discover_fail_to_pass_pass_to_pass_docker(
         )
 
     targets = collect_test_targets(lang, patch, test_patch)
+    if lang == "c":
+        from .integration_build import merge_hybrid_c_integration_paths
+
+        _detection, runner = merge_hybrid_c_integration_paths(
+            patch, test_patch, language=lang, test_paths=targets
+        )
+        if runner:
+            targets = runner
     if not targets:
         targets = collect_heuristic_test_paths_from_patch(
             "\n".join(p for p in (patch, test_patch) if p.strip())
@@ -1134,6 +1334,18 @@ def discover_fail_to_pass_pass_to_pass_docker(
         pytest_targets = tp_only if tp_only else targets
 
         eff_cfg = _docker_install_config_effective(install_config, pr, repo=repo)
+        if lang == "python" and repo is not None:
+            from .integration_build import apply_native_build_if_integration
+
+            from .apt_from_log import sanitize_native_integration_apt_config
+
+            eff_cfg = apply_native_build_if_integration(
+                eff_cfg,
+                repo,
+                test_paths=pytest_targets,
+                test_patch=test_patch,
+            )
+            eff_cfg = sanitize_native_integration_apt_config(eff_cfg)
         if lang == "java":
             eff_cfg = merge_java_build_into_config(
                 eff_cfg,
@@ -1177,10 +1389,11 @@ def discover_fail_to_pass_pass_to_pass_docker(
         elif lang == "ruby":
             from .ruby_build import ruby_install_config_for_repo
 
-            eff_cfg = ruby_install_config_for_repo(repo, base=eff_cfg)
+            eff_cfg = ruby_install_config_for_repo(repo, base=eff_cfg, test_paths=pytest_targets)
             print(
                 f"  {pr.instance_id}: ruby ruby_version="
                 f"{(eff_cfg.get('docker_specs') or {}).get('ruby_version')!r} "
+                f"test_runner={eff_cfg.get('ruby_test_runner')!r} "
                 f"test_cmd={str(eff_cfg.get('test_cmd') or '')[:80]!r}",
                 file=sys.stderr,
             )
@@ -1207,19 +1420,50 @@ def discover_fail_to_pass_pass_to_pass_docker(
                 file=sys.stderr,
             )
         elif lang == "c":
-            from .c_build import ensure_c_install_config
+            from .integration_build import (
+                apply_native_build_if_integration,
+                native_integration_discover_active,
+            )
 
-            eff_cfg = ensure_c_install_config(
+            impl_patch = str(row.get("patch") or "")
+            eff_cfg = apply_native_build_if_integration(
                 eff_cfg,
-                repo=repo,
+                repo,
                 test_paths=tp_only or pytest_targets,
                 test_patch=test_patch,
+                patch=impl_patch,
             )
+            from .apt_from_log import sanitize_native_integration_apt_config
+
+            eff_cfg = sanitize_native_integration_apt_config(eff_cfg)
+            if not native_integration_discover_active(eff_cfg):
+                from .c_build import ensure_c_install_config
+
+                eff_cfg = ensure_c_install_config(
+                    eff_cfg,
+                    repo=repo,
+                    test_paths=tp_only or pytest_targets,
+                    test_patch=test_patch,
+                )
             eff_cfg["language"] = "c"
+            if native_integration_discover_active(eff_cfg):
+                from .integration_build import merge_hybrid_c_integration_paths
+
+                _det, runner = merge_hybrid_c_integration_paths(
+                    impl_patch, test_patch, language="c"
+                )
+                if runner:
+                    tp_only = _test_patch_only_targets("c", test_patch) or runner
+                    pytest_targets = tp_only if tp_only else runner
+            runner_note = (
+                "pytest (native integration)"
+                if native_integration_discover_active(eff_cfg)
+                else str(eff_cfg.get("c_build_system") or "cmake")
+            )
             print(
-                f"  {pr.instance_id}: c build_system="
-                f"{eff_cfg.get('c_build_system') or 'cmake'} apt-pkgs="
+                f"  {pr.instance_id}: c build_system={runner_note} apt-pkgs="
                 f"{(eff_cfg.get('apt-pkgs') or [])!r} "
+                f"install={str(eff_cfg.get('install') or '')[:120]!r} "
                 f"test_cmd={str(eff_cfg.get('test_cmd') or '')[:80]!r}",
                 file=sys.stderr,
             )
@@ -1231,13 +1475,18 @@ def discover_fail_to_pass_pass_to_pass_docker(
         last_metrics: dict[str, Any] = {}
         setup_ready = False
         last_env_fp: dict[str, Any] | None = install_config_affects_env_image(eff_cfg)
+        from .integration_build import native_integration_already_applied
+
+        integration_native_retried = native_integration_already_applied(eff_cfg)
+        force_rebuild_env_next = False
 
         for attempt in range(1, max_r + 1):
             if attempt > 1:
                 print(f"  {pr.instance_id}: docker remediation attempt {attempt}/{max_r}", file=sys.stderr)
                 _reset_docker_repo(repo, base_commit, clone_timeout)
 
-            rebuild_env = force_rebuild_harness_images
+            rebuild_env = force_rebuild_harness_images or force_rebuild_env_next
+            force_rebuild_env_next = False
             if attempt > 1 and last_env_fp is not None:
                 rebuild_env = rebuild_env or (
                     install_config_affects_env_image(eff_cfg) != last_env_fp
@@ -1251,6 +1500,7 @@ def discover_fail_to_pass_pass_to_pass_docker(
                 pytest_targets=pytest_targets,
                 tp_only=tp_only,
                 targets=targets,
+                test_patch=test_patch,
                 docker_timeout=docker_timeout,
                 docker_pip_freeze_after=docker_pip_freeze_after,
                 attempt_label=f"install attempt {attempt}/{max_r}",
@@ -1287,9 +1537,18 @@ def discover_fail_to_pass_pass_to_pass_docker(
             if not install_failed and (last_n_patch > 0 or len(f2p) > 0):
                 if docker_pip_freeze_after:
                     _apply_pip_freeze_to_row(row, work, pr.instance_id)
+                stats = last_metrics.get("f2p_stats") or {}
+                stats_tail = ""
+                if stats:
+                    stats_tail = (
+                        f" cand_f2p={stats.get('cand_f2p', 0)}"
+                        f" dropped_ungradable_f2p={stats.get('dropped_f2p', 0)}"
+                        f" cand_p2p={stats.get('cand_p2p', 0)}"
+                        f" all_passed_both_phases={stats.get('all_passed_both_phases', 0)}"
+                    )
                 print(
-                    f"  {pr.instance_id}: docker FAIL_TO_PASS={len(f2p)} PASS_TO_PASS={len(p2p)} "
-                    f"(from install_config run, attempt {attempt})",
+                    f"  {pr.instance_id}: docker FAIL_TO_PASS={len(f2p)} PASS_TO_PASS={len(p2p)}"
+                    f"{stats_tail} (from install_config run, attempt {attempt})",
                     file=sys.stderr,
                 )
             elif install_failed:
@@ -1312,12 +1571,16 @@ def discover_fail_to_pass_pass_to_pass_docker(
                 not install_failed
                 and len(pytest_targets or targets) > 0
                 and last_n_patch == 0
-                and lang in ("java", "javascript")
+                and lang in ("java", "javascript", "python")
             )
             needs_junit_fix = junit_empty and (
                 lang == "javascript"
                 or log_indicates_maven_tests_ran(log_tail)
                 or log_indicates_gradle_build_ok(log_tail)
+                or (
+                    lang == "python"
+                    and native_integration_already_applied(eff_cfg)
+                )
             )
             needs_fix = install_failed or needs_junit_fix or (
                 (ea > 0 or (remediate_skips and fixable_sk)) and not slice_only_errors
@@ -1379,6 +1642,41 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     file=sys.stderr,
                 )
                 break
+            integration_native_retry = (
+                lang == "python"
+                and repo is not None
+                and len(pytest_targets or targets) > 0
+                and last_n_patch == 0
+                and int(last_metrics.get("docker_exit") or 0) == 0
+                and not integration_native_retried
+            )
+            if integration_native_retry:
+                from .integration_build import (
+                    native_build_install_config,
+                    repo_has_cmake_integration,
+                )
+
+                if repo_has_cmake_integration(
+                    repo, test_paths=tp_only or pytest_targets
+                ) and not native_integration_already_applied(eff_cfg):
+                    eff_cfg = native_build_install_config(
+                        eff_cfg,
+                        repo,
+                        test_paths=tp_only or pytest_targets,
+                        test_patch=test_patch,
+                    )
+                    row["install_config"] = export_install_config_for_harness(
+                        eff_cfg, language=lang
+                    )
+                    integration_native_retried = True
+                    force_rebuild_env_next = True
+                    last_env_fp = install_config_affects_env_image(eff_cfg)
+                    print(
+                        f"  {pr.instance_id}: cmake+integration pytest recipe — "
+                        f"re-running Docker (install + tests; rebuild env image)",
+                        file=sys.stderr,
+                    )
+                    continue
             if not needs_fix:
                 if sk > 0 and fixable_sk:
                     print(
@@ -1415,6 +1713,10 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     else:
                         reporter = "jest-junit"
                     reason = f"junit empty (fix test_cmd / {reporter} / targets)"
+                elif lang == "python":
+                    reason = (
+                        "junit empty (fix test_cmd / integration pytest root / CI env)"
+                    )
                 else:
                     reason = "junit empty but Maven/Gradle ran (fix test_cmd / junit roots)"
             elif ea > 0:
@@ -1480,8 +1782,38 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     )
                     continue
             if needs_junit_fix and lang == "javascript":
-                from .js_build import merge_js_build_into_config, runner_from_install_config
+                from .js_build import (
+                    install_config_remediation_unchanged_js,
+                    log_indicates_jest_haste_map_failure,
+                    merge_js_build_into_config,
+                    remediate_js_jest_haste_to_mocha,
+                    runner_from_install_config,
+                )
 
+                log_tail = (last_metrics.get("dstdout") or "") + "\n" + (
+                    last_metrics.get("dstderr") or ""
+                )
+                if log_indicates_jest_haste_map_failure(log_tail):
+                    haste_cfg = remediate_js_jest_haste_to_mocha(
+                        eff_cfg,
+                        repo,
+                        pytest_targets or targets,
+                        repo_dir="/testbed",
+                    )
+                    haste_cfg = _docker_install_config_effective(haste_cfg, pr, repo=repo)
+                    if not install_config_remediation_unchanged_js(eff_cfg, haste_cfg):
+                        eff_cfg = haste_cfg
+                        row["install_config"] = export_install_config_for_harness(
+                            eff_cfg, language=lang
+                        )
+                        last_env_fp = install_config_affects_env_image(eff_cfg)
+                        print(
+                            f"  {pr.instance_id}: applied JavaScript haste-map→mocha remediation "
+                            f"(test_cmd={str(eff_cfg.get('test_cmd') or '')[:100]!r}); "
+                            f"re-running Docker",
+                            file=sys.stderr,
+                        )
+                        continue
                 heuristic_cfg = merge_js_build_into_config(
                     eff_cfg,
                     repo,
@@ -1508,21 +1840,47 @@ def discover_fail_to_pass_pass_to_pass_docker(
                 if lang == "javascript":
                     from .js_build import remediate_js_install_from_log
 
-                    heuristic_cfg = remediate_js_install_from_log(eff_cfg, log_tail, repo=repo)
+                    heuristic_cfg = remediate_js_install_from_log(
+                        eff_cfg,
+                        log_tail,
+                        repo=repo,
+                        test_paths=pytest_targets or targets,
+                    )
                 elif lang == "c":
                     from .c_build import (
                         is_premake_repo,
                         premake_install_config_for_repo,
                         remediate_c_install_from_log,
                     )
+                    from .integration_build import (
+                        apply_native_build_if_integration,
+                        native_integration_already_applied,
+                        native_build_install_config,
+                    )
 
-                    heuristic_cfg = remediate_c_install_from_log(eff_cfg, log_tail, repo=repo)
+                    if native_integration_already_applied(eff_cfg) and repo is not None:
+                        heuristic_cfg = native_build_install_config(
+                            eff_cfg,
+                            repo,
+                            test_paths=tp_only or pytest_targets,
+                            test_patch=test_patch,
+                        )
+                    else:
+                        heuristic_cfg = remediate_c_install_from_log(eff_cfg, log_tail, repo=repo)
                     if repo is not None and is_premake_repo(repo):
                         heuristic_cfg = premake_install_config_for_repo(
                             repo,
                             base=heuristic_cfg,
                             test_paths=tp_only or pytest_targets,
                             test_patch=test_patch,
+                        )
+                    if repo is not None:
+                        heuristic_cfg = apply_native_build_if_integration(
+                            heuristic_cfg,
+                            repo,
+                            test_paths=tp_only or pytest_targets,
+                            test_patch=test_patch,
+                            patch=str(row.get("patch") or ""),
                         )
                 elif lang == "ruby":
                     from .ruby_build import remediate_ruby_install_from_log
@@ -1538,11 +1896,58 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     from .php_build import remediate_php_install_from_log
 
                     heuristic_cfg = remediate_php_install_from_log(eff_cfg, log_tail)
+                elif lang == "go":
+                    from .go_build import remediate_go_install_from_log
+
+                    heuristic_cfg = remediate_go_install_from_log(
+                        eff_cfg,
+                        log_tail,
+                        docker_exit=int(last_metrics.get("docker_exit") or 0),
+                        n_patch=int(last_metrics.get("n_patch") or 0),
+                    )
+                elif lang == "python" and repo is not None:
+                    from .integration_build import (
+                        apply_native_build_if_integration,
+                        native_build_install_config,
+                        native_integration_already_applied,
+                        repo_has_cmake_integration,
+                    )
+
+                    if repo_has_cmake_integration(
+                        repo, test_paths=tp_only or pytest_targets
+                    ) and not native_integration_already_applied(eff_cfg):
+                        heuristic_cfg = native_build_install_config(
+                            eff_cfg,
+                            repo,
+                            test_paths=tp_only or pytest_targets,
+                            test_patch=test_patch,
+                        )
+                    elif native_integration_already_applied(eff_cfg):
+                        heuristic_cfg = dict(eff_cfg)
+                    else:
+                        from .apt_from_log import remediate_apt_install_from_log
+
+                        heuristic_cfg = remediate_apt_install_from_log(eff_cfg, log_tail)
                 else:
                     from .apt_from_log import remediate_apt_install_from_log
 
                     heuristic_cfg = remediate_apt_install_from_log(eff_cfg, log_tail)
                 heuristic_cfg = _docker_install_config_effective(heuristic_cfg, pr, repo=repo)
+                if lang in ("python", "c") and repo is not None:
+                    from .integration_build import apply_native_build_if_integration
+
+                    heuristic_cfg = apply_native_build_if_integration(
+                        heuristic_cfg,
+                        repo,
+                        test_paths=tp_only or pytest_targets,
+                        test_patch=test_patch,
+                        patch=str(row.get("patch") or ""),
+                    )
+                    from .apt_from_log import sanitize_native_integration_apt_config
+
+                    heuristic_cfg = sanitize_native_integration_apt_config(heuristic_cfg)
+                    if lang == "c":
+                        heuristic_cfg["language"] = "c"
                 if not install_config_remediation_unchanged(eff_cfg, heuristic_cfg):
                     eff_cfg = heuristic_cfg
                     row["install_config"] = export_install_config_for_harness(eff_cfg, language=lang)
@@ -1575,6 +1980,8 @@ def discover_fail_to_pass_pass_to_pass_docker(
             )
             api_key, base_url, model, to = llm_remediate
             try:
+                from .install_config_build import get_ci_excerpt_from_config
+
                 eff_cfg = llm_fix_recipe_from_docker_tests(
                     eff_cfg,
                     blob,
@@ -1582,6 +1989,7 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     base_url=base_url,
                     model=model,
                     timeout_s=to,
+                    ci_context=get_ci_excerpt_from_config(eff_cfg),
                 )
                 eff_cfg = _docker_install_config_effective(eff_cfg, pr, repo=repo)
                 if install_failed:
@@ -1679,6 +2087,7 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     pytest_targets=pytest_targets,
                     tp_only=tp_only,
                     targets=targets,
+                    test_patch=test_patch,
                     docker_timeout=docker_timeout,
                     docker_pip_freeze_after=docker_pip_freeze_after,
                     attempt_label="dateutil zoneinfo",
@@ -1707,12 +2116,21 @@ def discover_fail_to_pass_pass_to_pass_docker(
         tp_label_mismatch = bool(last_metrics.get("test_patch_label_mismatch"))
         from .languages import get_language_spec
 
-        cargo_log = get_language_spec(lang).result_format == "cargo_log"
+        spec = get_language_spec(lang)
+        cargo_log = spec.result_format == "cargo_log"
+        gotest_log = spec.result_format == "gotest_log"
         if tp_label_mismatch and cargo_log and f2p and not tp_failures:
             tp_label_mismatch = False
             print(
                 f"  {pr.instance_id}: rust cargo log keys do not map to test_patch paths "
                 f"but FAIL_TO_PASS={len(f2p)} — skipping test_patch label-mismatch LLM",
+                file=sys.stderr,
+            )
+        if tp_label_mismatch and gotest_log and f2p and not tp_failures:
+            tp_label_mismatch = False
+            print(
+                f"  {pr.instance_id}: gotest log keys use Test* names (not *_test.go paths); "
+                f"FAIL_TO_PASS={len(f2p)} — skipping test_patch label-mismatch LLM",
                 file=sys.stderr,
             )
         after_patch_empty = bool(last_metrics.get("after_patch_empty"))
@@ -1781,7 +2199,13 @@ def discover_fail_to_pass_pass_to_pass_docker(
                         )
                     else:
                         slice_fl, slice_el, _ = junit_fail_error_skip_messages_for_paths(
-                            patch_junit, repo_root, tp_only, language=lang
+                            patch_junit,
+                            repo_root,
+                            tp_only,
+                            language=lang,
+                            native_integration_pytest_root=_native_integration_pytest_root(
+                                eff_cfg
+                            ),
                         )
                 else:
                     slice_fl, slice_el, _ = junit_fail_error_skip_messages_limited(
@@ -1943,6 +2367,7 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     pytest_targets=pytest_targets,
                     tp_only=tp_only,
                     targets=targets,
+                    test_patch=test_patch,
                     docker_timeout=docker_timeout,
                     docker_pip_freeze_after=docker_pip_freeze_after,
                     attempt_label=f"test_patch attempt {tp_attempt}/{max_tp_r}",
@@ -1980,7 +2405,12 @@ def discover_fail_to_pass_pass_to_pass_docker(
 
         if test_patch_remediated or test_patch_created_by_llm:
             f2p = _filter_f2p_to_test_patch_scope(
-                f2p, tp_only, lang, django_runtests=django_rt
+                f2p,
+                tp_only,
+                lang,
+                django_runtests=django_rt,
+                native_integration_pytest_root=_native_integration_pytest_root(eff_cfg),
+                test_patch=test_patch,
             )
             p2p = []
             print(

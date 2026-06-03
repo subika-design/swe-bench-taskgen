@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
+import re
+from typing import Any, Iterable
 
 from .install_llm import merge_pre_install_debian_packages
+
+# Not in default Ubuntu 22.04 apt; must not fail env-image ``apt-get install``.
+_APT_INTEGRATION_BLOCKLIST = frozenset({"caddy", "h2o"})
 
 # (log substring, debian package names)
 BUILD_LOG_APT_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -96,20 +100,125 @@ def apt_packages_from_build_log(log: str) -> list[str]:
     return found
 
 
+def sanitize_apt_package_names(pkgs: Iterable[str]) -> list[str]:
+    """Drop blocklisted / invalid Debian package tokens (integration server tools)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in pkgs:
+        tok = str(raw).strip()
+        if not tok:
+            continue
+        low = tok.lower()
+        if low in _APT_INTEGRATION_BLOCKLIST:
+            continue
+        if not re.match(r"^[a-z0-9][a-z0-9+.-]*$", tok, re.IGNORECASE):
+            continue
+        if low not in seen:
+            seen.add(low)
+            out.append(tok)
+    return out
+
+
 def merge_apt_into_config(cfg: dict[str, Any], deb_packages: list[str]) -> dict[str, Any]:
     """Merge Debian packages into ``pre_install`` and ``apt-pkgs``."""
+    deb_packages = sanitize_apt_package_names(deb_packages)
     if not deb_packages:
         return cfg
     out = dict(cfg)
     pre = list(out.get("pre_install") or [])
     out["pre_install"] = merge_pre_install_debian_packages(pre, list(deb_packages))
-    apt = list(out.get("apt-pkgs") or [])
-    seen = set(apt)
-    for pkg in deb_packages:
-        if pkg not in seen:
-            seen.add(pkg)
-            apt.append(pkg)
+    apt = sanitize_apt_package_names(list(out.get("apt-pkgs") or []) + deb_packages)
     out["apt-pkgs"] = apt
+    return out
+
+
+def merge_integration_apt_into_config(
+    cfg: dict[str, Any],
+    deb_packages: list[str],
+    *,
+    optional: list[str] | None = None,
+) -> dict[str, Any]:
+    """
+    Merge required apt packages; optional ones install with ``|| true`` (env image only).
+    """
+    required = sanitize_apt_package_names(deb_packages)
+    opt = sanitize_apt_package_names(optional or [])
+    out = merge_apt_into_config(cfg, required) if required else dict(cfg)
+    if opt:
+        existing = sanitize_apt_package_names(out.get("apt-pkgs-optional") or [])
+        seen = set(existing)
+        merged_opt = list(existing)
+        for pkg in opt:
+            if pkg not in seen:
+                seen.add(pkg)
+                merged_opt.append(pkg)
+        out["apt-pkgs-optional"] = merged_opt
+    return out
+
+
+def _native_integration_http3_install(cfg: dict[str, Any]) -> bool:
+    install = str(cfg.get("install") or "")
+    return "USE_NGTCP2" in install.upper() or "USE_PROXY_HTTP3" in install.upper()
+
+
+def sanitize_native_integration_apt_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Strip blocklisted apt names and unsafe shell lines from native-integration configs."""
+    if not cfg.get("native_integration_build"):
+        return cfg
+    from .integration_build import (
+        filter_native_integration_apt_packages,
+        native_integration_eval_commands,
+        strip_unsafe_native_shell_lines,
+    )
+
+    http3 = _native_integration_http3_install(cfg)
+    out = dict(cfg)
+    def _sanitize_pkgs(pkgs: list[str]) -> list[str]:
+        cleaned = sanitize_apt_package_names(pkgs)
+        if http3:
+            for name in ("h2o",):
+                if name in {p.lower() for p in pkgs} and name not in {p.lower() for p in cleaned}:
+                    cleaned.append(name)
+        return filter_native_integration_apt_packages(cleaned)
+
+    out["apt-pkgs"] = _sanitize_pkgs(list(out.get("apt-pkgs") or []))
+    opt = _sanitize_pkgs(list(out.get("apt-pkgs-optional") or []))
+    if opt:
+        out["apt-pkgs-optional"] = opt
+    else:
+        out.pop("apt-pkgs-optional", None)
+    pre = list(out.get("pre_install") or [])
+    if pre:
+        from .install_llm import _APT_INSTALL_LINE
+
+        cleaned: list[str] = []
+        for ln in pre:
+            stripped = ln.strip()
+            m = _APT_INSTALL_LINE.match(stripped)
+            if m:
+                pkgs = sanitize_apt_package_names(m.group(1).split())
+                if http3:
+                    for name in ("h2o",):
+                        if name in {p.lower() for p in m.group(1).split()} and name not in {
+                            p.lower() for p in pkgs
+                        }:
+                            pkgs.append(name)
+                if not pkgs:
+                    continue
+                prefix = (
+                    "apt-get install -y --no-install-recommends"
+                    if "--no-install-recommends" in stripped
+                    else "apt-get install -y"
+                )
+                cleaned.append(f"{prefix} {' '.join(pkgs)}")
+            else:
+                cleaned.append(ln)
+        out["pre_install"] = cleaned
+    for key in ("post_install", "native_integration_setup"):
+        vals = out.get(key)
+        if isinstance(vals, list) and vals:
+            out[key] = strip_unsafe_native_shell_lines(vals)
+    out["eval_commands"] = native_integration_eval_commands(out)
     return out
 
 
@@ -122,4 +231,7 @@ def remediate_apt_install_from_log(cfg: dict[str, Any], log: str) -> dict[str, A
     """Apply log-driven apt package fixes (language-agnostic)."""
     out = ensure_base_build_apt(dict(cfg))
     deb = apt_packages_from_build_log(log)
-    return merge_apt_into_config(out, deb)
+    out = merge_apt_into_config(out, deb)
+    if out.get("native_integration_build"):
+        out = sanitize_native_integration_apt_config(out)
+    return out

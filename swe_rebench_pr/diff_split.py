@@ -291,8 +291,30 @@ def _resolve_repo_py_path(repo_root: Path, rel: str) -> str | None:
     return None
 
 
+_RUBY_SPEC_SUFFIXES = ("_spec.rb", "_test.rb")
+
+
+def _is_ruby_spec_relpath(rel: str) -> bool:
+    low = rel.replace("\\", "/").lower()
+    return any(low.endswith(suffix) for suffix in _RUBY_SPEC_SUFFIXES)
+
+
+def _ruby_path_basename_aliases(rel: str) -> frozenset[str]:
+    rel = rel.replace("\\", "/").strip().lstrip("/")
+    if not rel:
+        return frozenset()
+    name = Path(rel).name
+    aliases = {name}
+    for suffix in _RUBY_SPEC_SUFFIXES:
+        if name.endswith(suffix):
+            stem = name[: -len(suffix)]
+            if stem:
+                aliases.add(stem)
+    return frozenset(aliases)
+
+
 def _resolve_repo_test_path(repo_root: Path, rel: str) -> str | None:
-    """Return repo-relative path if a Python or JS/TS test file exists on disk."""
+    """Return repo-relative path if a Python, Ruby, or JS/TS test file exists on disk."""
     resolved = _resolve_repo_py_path(repo_root, rel)
     if resolved:
         return resolved
@@ -303,6 +325,8 @@ def _resolve_repo_test_path(repo_root: Path, rel: str) -> str | None:
     candidates = {rel}
     if _is_js_test_relpath(rel):
         candidates.add(Path(rel).name)
+    if _is_ruby_spec_relpath(rel):
+        candidates.update(_ruby_path_basename_aliases(rel))
     for candidate in candidates:
         if (root / candidate).is_file():
             return candidate
@@ -383,11 +407,13 @@ def _path_filter_sets(paths: list[str]) -> tuple[frozenset[str], frozenset[str],
     dotted: set[str] = set()
     java_fqcns: set[str] = set()
     js_basenames: set[str] = set()
+    ruby_basenames: set[str] = set()
     for p in paths:
         fqcn = java_fqcn_from_test_path(p)
         if fqcn:
             java_fqcns.add(fqcn)
         js_basenames.update(_js_path_basename_aliases(p))
+        ruby_basenames.update(_ruby_path_basename_aliases(p))
         if p.replace("\\", "/").endswith(".lua"):
             from .c_build import premake_suite_from_test_path
 
@@ -397,8 +423,11 @@ def _path_filter_sets(paths: list[str]) -> tuple[frozenset[str], frozenset[str],
         for alias in _test_path_aliases(p):
             path_set.add(alias)
             js_basenames.update(_js_path_basename_aliases(alias))
+            ruby_basenames.update(_ruby_path_basename_aliases(alias))
             if alias.endswith(".py"):
                 dotted.add(alias.removesuffix(".py").replace("/", "."))
+            if _is_ruby_spec_relpath(alias):
+                dotted.add(alias.removesuffix(".rb").replace("/", "."))
             if alias.replace("\\", "/").endswith(".lua"):
                 from .c_build import premake_suite_from_test_path
 
@@ -409,6 +438,7 @@ def _path_filter_sets(paths: list[str]) -> tuple[frozenset[str], frozenset[str],
             if alias_fqcn:
                 java_fqcns.add(alias_fqcn)
     path_set.update(js_basenames)
+    path_set.update(ruby_basenames)
     return frozenset(path_set), frozenset(dotted), frozenset(java_fqcns)
 
 
@@ -454,6 +484,38 @@ def _cargo_log_key_in_test_patch_paths(nodeid: str, paths: list[str]) -> bool:
     return False
 
 
+def _nodeid_matches_native_integration_root(
+    nodeid: str,
+    test_patch_paths: list[str],
+    pytest_root: str,
+) -> bool:
+    """
+    Match JUnit keys when pytest cwd is *pytest_root* (``NATIVE_PYTEST_ROOT``).
+
+    Git ``test_patch`` paths are repo-relative (``tests/http/test_foo.py``); JUnit
+    often reports heads under the suite dir (``test_foo/TestClass.py::test_name``).
+    """
+    root = pytest_root.replace("\\", "/").strip().strip("/")
+    if not root or not nodeid or not test_patch_paths:
+        return False
+    head = _nodeid_leading_relpath(nodeid)
+    prefix = root + "/"
+    for raw in test_patch_paths:
+        p = raw.replace("\\", "/").strip().lstrip("/")
+        if not p.startswith(prefix):
+            continue
+        rel = p[len(prefix) :]
+        if not rel:
+            continue
+        if head == rel or head.startswith(rel + "/"):
+            return True
+        if rel.endswith(".py"):
+            stem = Path(rel).stem
+            if head == stem or head.startswith(stem + "/"):
+                return True
+    return False
+
+
 def _nodeid_in_test_patch_paths(
     nodeid: str,
     path_set: frozenset[str],
@@ -461,13 +523,34 @@ def _nodeid_in_test_patch_paths(
     java_fqcns: frozenset[str] = frozenset(),
     *,
     test_patch_paths: list[str] | None = None,
+    test_patch: str = "",
     language: str = "",
+    native_integration_pytest_root: str = "",
 ) -> bool:
+    if native_integration_pytest_root and test_patch_paths:
+        if _nodeid_matches_native_integration_root(
+            nodeid, test_patch_paths, native_integration_pytest_root
+        ):
+            return True
     if language:
         from .languages import get_language_spec
 
         if get_language_spec(language).result_format == "cargo_log" and test_patch_paths:
             if _cargo_log_key_in_test_patch_paths(nodeid, test_patch_paths):
+                return True
+        if get_language_spec(language).result_format == "gotest_log" and test_patch_paths:
+            from .go_build import gotest_log_key_in_test_patch_paths
+
+            if gotest_log_key_in_test_patch_paths(
+                nodeid,
+                list(test_patch_paths),
+                test_patch=test_patch,
+            ):
+                return True
+        if language.lower() in ("ruby", "rb") and test_patch_paths:
+            from .ruby_build import rspec_junit_nodeid_in_test_patch_paths
+
+            if rspec_junit_nodeid_in_test_patch_paths(nodeid, list(test_patch_paths)):
                 return True
     if " > " in nodeid:
         class_part = nodeid.split(" > ", 1)[0].strip()
@@ -490,6 +573,11 @@ def _nodeid_in_test_patch_paths(
         for ext in _JS_TEST_EXTENSIONS:
             if head_base.endswith(ext) and head_base[: -len(ext)] in path_set:
                 return True
+        for suffix in _RUBY_SPEC_SUFFIXES:
+            if head_base.endswith(suffix):
+                stem = head_base[: -len(suffix)]
+                if stem in path_set or head_base in path_set:
+                    return True
     if "/" not in head and _is_js_test_relpath(head):
         if head in path_set or Path(head).name in path_set:
             return True
@@ -529,6 +617,8 @@ def has_test_patch_label_mismatch(
     *,
     django_runtests: bool = False,
     language: str = "",
+    native_integration_pytest_root: str = "",
+    test_patch: str = "",
 ) -> bool:
     """True when the after-patch log has cases but none match ``test_patch`` paths/labels."""
     if not test_patch_paths or not case_map:
@@ -541,9 +631,28 @@ def has_test_patch_label_mismatch(
     from .languages import get_language_spec
 
     if language:
-        if get_language_spec(language).result_format == "cargo_log":
+        spec = get_language_spec(language)
+        if spec.result_format == "cargo_log":
             if any(
                 _cargo_log_key_in_test_patch_paths(nid, test_patch_paths) for nid in case_map
+            ):
+                return False
+        if spec.result_format == "gotest_log":
+            from .go_build import gotest_log_key_in_test_patch_paths
+
+            if any(
+                gotest_log_key_in_test_patch_paths(
+                    nid, test_patch_paths, test_patch=test_patch
+                )
+                for nid in case_map
+            ):
+                return False
+        if language.lower() in ("ruby", "rb"):
+            from .ruby_build import rspec_junit_nodeid_in_test_patch_paths
+
+            if any(
+                rspec_junit_nodeid_in_test_patch_paths(nid, test_patch_paths)
+                for nid in case_map
             ):
                 return False
     path_set, dotted, java_fqcns = _path_filter_sets(test_patch_paths)
@@ -554,7 +663,9 @@ def has_test_patch_label_mismatch(
             dotted,
             java_fqcns,
             test_patch_paths=test_patch_paths,
+            test_patch=test_patch,
             language=language,
+            native_integration_pytest_root=native_integration_pytest_root,
         )
         for nid in case_map
     )
@@ -577,6 +688,9 @@ def log_junit_test_patch_mismatch(
     test_patch_paths: list[str],
     *,
     limit: int = 20,
+    native_integration_pytest_root: str = "",
+    test_patch: str = "",
+    language: str = "",
 ) -> None:
     """Print sample JUnit nodeids when none match ``test_patch_paths`` (debugging path alignment)."""
     if not test_patch_paths or not case_map:
@@ -585,12 +699,22 @@ def log_junit_test_patch_mismatch(
     matched = [
         nid
         for nid in case_map
-        if _nodeid_in_test_patch_paths(nid, path_set, dotted, java_fqcns)
+        if _nodeid_in_test_patch_paths(
+            nid,
+            path_set,
+            dotted,
+            java_fqcns,
+            test_patch_paths=test_patch_paths,
+            test_patch=test_patch,
+            language=language,
+            native_integration_pytest_root=native_integration_pytest_root,
+        )
     ]
     unmatched = [nid for nid in case_map if nid not in matched]
+    label = "gotest name(s)" if language == "go" else "test_patch path(s)"
     print(
         f"  {instance_id}: junit debug — {len(case_map)} case(s) in patch junit, "
-        f"{len(matched)} matched test_patch path(s), {len(unmatched)} unmatched",
+        f"{len(matched)} matched {label}, {len(unmatched)} unmatched",
         file=sys.stderr,
     )
     print(
@@ -612,6 +736,8 @@ def junit_outcome_counts_for_paths(
     paths: list[str],
     *,
     language: str = "",
+    native_integration_pytest_root: str = "",
+    test_patch: str = "",
 ) -> tuple[int, int, int, int, int]:
     """
     Count JUnit outcomes for test cases whose file prefix matches one of ``paths``.
@@ -627,7 +753,9 @@ def junit_outcome_counts_for_paths(
             dotted_prefixes,
             java_fqcns,
             test_patch_paths=paths,
+            test_patch=test_patch,
             language=language,
+            native_integration_pytest_root=native_integration_pytest_root,
         ):
             continue
         if outcome == "passed":
@@ -667,6 +795,8 @@ def junit_fail_error_skip_messages_for_paths(
     paths: list[str],
     *,
     language: str = "python",
+    native_integration_pytest_root: str = "",
+    test_patch: str = "",
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]]]:
     """
     Collect ``(nodeid, reason)`` for failure / error / skipped testcases in ``paths``.
@@ -690,7 +820,16 @@ def junit_fail_error_skip_messages_for_paths(
             language=language,
             suite_file=suite_file,
         )
-        if not _nodeid_in_test_patch_paths(nid, path_set, dotted_prefixes, java_fqcns):
+        if not _nodeid_in_test_patch_paths(
+            nid,
+            path_set,
+            dotted_prefixes,
+            java_fqcns,
+            test_patch_paths=paths,
+            test_patch=test_patch,
+            language=language,
+            native_integration_pytest_root=native_integration_pytest_root,
+        ):
             continue
         for child in case:
             ctag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
@@ -909,6 +1048,32 @@ def junit_case_to_mocha_nodeid(
     return name
 
 
+def junit_case_to_rspec_nodeid(
+    case: ET.Element,
+    repo_root: Path,
+    *,
+    suite_file: str | None = None,
+) -> str:
+    """Node id for ``rspec_junit_formatter`` (repo-relative ``*_spec.rb`` + example name)."""
+    name = (case.attrib.get("name") or "").strip()
+    classname = (case.attrib.get("classname") or "").strip()
+    file_a = case.attrib.get("file") or suite_file
+    rel_s = ""
+    if file_a:
+        rel_s = _junit_file_to_repo_relpath(str(file_a), repo_root)
+        resolved = _resolve_repo_test_path(repo_root, rel_s)
+        if resolved:
+            rel_s = resolved
+    if rel_s:
+        if classname and classname != name and not classname.startswith(rel_s):
+            if "::" in classname or " " in classname:
+                return f"{rel_s}::{classname}::{name}" if name else f"{rel_s}::{classname}"
+        return f"{rel_s}::{name}" if name else rel_s
+    if classname:
+        return f"{classname}::{name}" if name else classname
+    return name
+
+
 def harness_test_label(
     case: ET.Element,
     repo_root: Path,
@@ -922,6 +1087,8 @@ def harness_test_label(
         return junit_case_to_gradle_test_key(case, repo_root)
     if lang in ("javascript", "js", "typescript", "ts", "node"):
         return junit_case_to_mocha_nodeid(case, repo_root, suite_file=suite_file)
+    if lang in ("ruby", "rb"):
+        return junit_case_to_rspec_nodeid(case, repo_root, suite_file=suite_file)
     return junit_case_to_nodeid(case, repo_root)
 
 
@@ -1055,6 +1222,13 @@ def swebench_gradable_nodeid(
         # Vitest/Jest names often contain spaces (e.g. ``suite > case``); path prefix must not.
         head = nodeid.split("::", 1)[0]
         return bool(head.strip()) and " " not in head
+    if lang in ("ruby", "rb"):
+        # RSpec/Minitest example titles often contain spaces after ``path::``.
+        head = nodeid.split("::", 1)[0].replace("\\", "/").strip()
+        if not head or " " in head:
+            return False
+        low = head.lower()
+        return low.endswith("_spec.rb") or low.endswith("_test.rb")
     if " " in nodeid:
         return False
     if language == "python":

@@ -42,6 +42,101 @@ def _pytest_extra_args_block(install_config: dict[str, Any]) -> str:
     return "\n".join(parts) + "\n" if parts else ""
 
 
+def _python_native_integration_block(
+    install_config: dict[str, Any], *, repo_dir: str
+) -> str:
+    """``cd`` into integration pytest root and rebase target paths (CMake + pytest suites)."""
+    if not install_config.get("native_integration_build"):
+        return ""
+    root = str(install_config.get("native_integration_pytest_root") or "").strip().strip("/")
+    if not root:
+        return ""
+    qroot = _sh_quote(root)
+    qrepo = _sh_quote(repo_dir)
+    return f"""NATIVE_PYTEST_ROOT={qroot}
+if [[ -n "${{NATIVE_PYTEST_ROOT}}" ]]; then
+  cd {qrepo}/"${{NATIVE_PYTEST_ROOT}}"
+  declare -a _TNEW=()
+  for _p in "${{T[@]}}"; do
+    if [[ "$_p" == "${{NATIVE_PYTEST_ROOT}}"/* ]]; then
+      _TNEW+=("${{_p#${{NATIVE_PYTEST_ROOT}}/}}")
+    elif [[ "$_p" == "./${{NATIVE_PYTEST_ROOT}}"/* ]]; then
+      _TNEW+=("${{_p#./${{NATIVE_PYTEST_ROOT}}/}}")
+    else
+      _TNEW+=("$_p")
+    fi
+  done
+  if [[ ${{#_TNEW[@]}} -gt 0 ]]; then
+    T=("${{_TNEW[@]}}")
+  fi
+fi
+"""
+
+
+def _python_integration_test_cmd_block(install_config: dict[str, Any]) -> str:
+    if not install_config.get("native_integration_build"):
+        return 'PY_INTEGRATION_TEST_CMD=""\n'
+    tc = str(install_config.get("test_cmd") or "").strip()
+    if not tc:
+        return 'PY_INTEGRATION_TEST_CMD=""\n'
+    return f'PY_INTEGRATION_TEST_CMD="{_sh_escape_double(tc)}"\n'
+
+
+def _native_integration_setup_block(
+    install_config: dict[str, Any],
+    *,
+    repo_dir: str = "/w/repo",
+) -> str:
+    """Re-run setup from repo root (config.ini, cmake targets) after reset/clean."""
+    if not install_config.get("native_integration_build"):
+        return ""
+    lines = install_config.get("native_integration_setup")
+    if not isinstance(lines, list) or not lines:
+        return ""
+    from .integration_build import native_integration_repo_dir
+
+    setup_repo = native_integration_repo_dir(install_config)
+    if repo_dir.rstrip("/") not in ("", "/w/repo", "/"):
+        setup_repo = repo_dir.rstrip("/")
+    qrepo = _sh_quote(setup_repo)
+    body: list[str] = ['echo "[docker] native integration setup" >&2']
+    for raw in lines:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        body.append(f"(cd {qrepo} && {raw.strip()}) || true")
+    return "\n".join(body) + "\n"
+
+
+def _run_python_integration_tests_fn(setup_block: str = "") -> str:
+    setup = setup_block.strip()
+    if setup and not setup.endswith("\n"):
+        setup += "\n"
+    return f"""
+_run_python_integration_tests() {{
+  local junit_out="$1"
+  local log="$2"
+  local cmd=""
+{setup}  if [[ -n "${{PY_INTEGRATION_TEST_CMD:-}}" ]]; then
+    cmd="${{PY_INTEGRATION_TEST_CMD//__JUNIT_OUT__/$junit_out}}"
+    cmd="${{cmd//__TARGETS__/}}"
+    echo "[docker] integration pytest (${{#T[@]}} path(s))" >&2
+    eval "$cmd" "${{T[@]}}" 2>&1 | tee "$log" || true
+  else
+    python3 -m pytest "${{PYT_EXTRA[@]}}" "${{T[@]}}" \\
+      --junitxml="$junit_out" -o junit_family=xunit2 --tb=short -rA 2>&1 | tee "$log" || true
+  fi
+  python3 /w/empty_junit_if_missing.py "$junit_out" "$log" || true
+}}
+"""
+
+
+def _python_pytest_report_flags(install_config: dict[str, Any]) -> str:
+    """JUnit is primary; use ``-rA`` for native integration (SWE-bench log parsers need non-quiet)."""
+    if install_config.get("native_integration_build"):
+        return "-rA"
+    return "-q"
+
+
 def _pytest_plugin_block(install_config: dict[str, Any]) -> str:
     plugins = install_config.get("pytest_plugins") or []
     if not isinstance(plugins, list):
@@ -214,6 +309,10 @@ fi
 
 def _eval_commands_block(install_config: dict[str, Any]) -> str:
     cmds = install_config.get("eval_commands") or []
+    if install_config.get("native_integration_build"):
+        from .integration_build import native_integration_eval_commands
+
+        cmds = native_integration_eval_commands(install_config)
     if not isinstance(cmds, list):
         return ""
     lines: list[str] = []
@@ -276,12 +375,23 @@ fi
     )
 
 
-def _python_git_clean_after_reset() -> str:
+def _python_git_clean_after_reset(install_config: dict[str, Any] | None = None) -> str:
     """Remove untracked files left by ``test_patch`` (new tests) after ``git reset --hard``."""
+    excludes = [
+        "-e subprojects ",
+        "-e src/dateutil/zoneinfo/dateutil-zoneinfo.tar.gz ",
+    ]
+    if install_config and install_config.get("native_integration_build"):
+        excludes.append("-e build ")
+        root = str(install_config.get("native_integration_pytest_root") or "").strip().strip("/")
+        if root:
+            excludes.append(f"-e {root}/config.ini ")
+            excludes.append(f"-e {root}/gen ")
+    exclude_args = "".join(excludes)
     return (
-        "git clean -ffdx "
-        "-e subprojects "
-        "-e src/dateutil/zoneinfo/dateutil-zoneinfo.tar.gz "
+        f"git clean -ffdx {exclude_args}"
+        "2>/dev/null || git clean -ffdx "
+        f"{exclude_args}"
         "2>/dev/null || git clean -ffdx"
     )
 
@@ -300,6 +410,37 @@ def _python_body(
     extra_args_block = _pytest_extra_args_block(install_config)
     env_block = _test_env_block(install_config)
     django_settings_block = _django_pytest_settings_block(install_config)
+    native_block = _python_native_integration_block(install_config, repo_dir=repo_dir)
+    integration_cmd_block = _python_integration_test_cmd_block(install_config)
+    use_integration_runner = bool(install_config.get("native_integration_build"))
+    restore_repo = f"cd {_sh_quote(repo_dir)}\n" if native_block else ""
+    report_flags = _python_pytest_report_flags(install_config)
+    if use_integration_runner:
+        setup_block = _native_integration_setup_block(install_config, repo_dir=repo_dir)
+        run_tests_fn = _run_python_integration_tests_fn(setup_block)
+        pytest_base = (
+            native_block
+            + '_run_python_integration_tests /w/junit-base.xml /w/test-base.log\n'
+            + restore_repo
+        )
+        pytest_patch = native_block + (
+            '_run_python_integration_tests /w/junit-patch.xml /w/test-patch.log\n'
+            + restore_repo
+        )
+    else:
+        run_tests_fn = ""
+        pytest_base = (
+            native_block
+            + rf"""python3 -m pytest "${{PYT_EXTRA[@]}}" "${{T[@]}}" """
+            + rf"""--junitxml=/w/junit-base.xml -o junit_family=xunit2 --tb=no {report_flags} || true
+{restore_repo}"""
+        )
+        pytest_patch = (
+            native_block
+            + rf"""python3 -m pytest "${{PYT_EXTRA[@]}}" "${{T[@]}}" """
+            + rf"""--junitxml=/w/junit-patch.xml -o junit_family=xunit2 --tb=no {report_flags} || true
+{restore_repo}"""
+        )
     body = (
         _common_header(
             repo_dir=repo_dir,
@@ -313,46 +454,42 @@ def _python_body(
         + django_settings_block
         + env_block
         + _eval_commands_block(install_config)
+        + integration_cmd_block
         + "PYT_EXTRA=()\n"
         + (plugin_block + "\n" if plugin_block else "")
         + extra_args_block
         + _apply_one_fn()
-        + r"""echo "[docker] pytest ${#T[@]} path(s) (base + test_patch only)" >&2
+        + run_tests_fn
+        + rf"""echo "[docker] pytest ${{#T[@]}} path(s) (base + test_patch only)" >&2
 _apply_one /w/test.patch || exit 1
-python3 -m pytest "${PYT_EXTRA[@]}" "${T[@]}" --junitxml=/w/junit-base.xml -o junit_family=xunit2 --tb=no -q || true
-echo "[docker] reset to base_commit" >&2
+"""
+        + pytest_base
+        + """echo "[docker] reset to base_commit" >&2
 git reset --hard "${SWEBENCH_BASE_COMMIT:-HEAD}"
 """
-        + _python_git_clean_after_reset()
+        + _python_git_clean_after_reset(install_config)
         + "\n"
         + _eval_commands_block(install_config)
-        + r"""echo "[docker] pytest ${#T[@]} path(s) (test_patch + impl.patch)" >&2
+        + rf"""echo "[docker] pytest ${{#T[@]}} path(s) (test_patch + impl.patch)" >&2
 _apply_one /w/test.patch || exit 1
 _apply_one /w/impl.patch || exit 1
-python3 -m pytest "${PYT_EXTRA[@]}" "${T[@]}" --junitxml=/w/junit-patch.xml -o junit_family=xunit2 --tb=no -q || true
 """
+        + pytest_patch
         + (_pip_freeze_block() if run_pip_freeze else "")
     )
     return body
 
 
 def _go_packages_from_targets(targets: list[str]) -> list[str]:
-    pkgs: set[str] = set()
-    for t in targets:
-        if not t.endswith("_test.go"):
-            continue
-        parts = t.replace("\\", "/").split("/")
-        if len(parts) <= 1:
-            pkgs.add("./...")
-            continue
-        pkg_dir = "/".join(parts[:-1])
-        pkgs.add(f"./{pkg_dir}")
-    return sorted(pkgs) or ["./..."]
+    from .go_build import go_packages_from_test_paths
+
+    return go_packages_from_test_paths(targets)
 
 
 def _go_body(
     targets: list[str],
     run_pip_freeze: bool,
+    install_config: dict[str, Any] | None = None,
     *,
     repo_dir: str = "/w/repo",
     skip_install: bool = False,
@@ -360,32 +497,34 @@ def _go_body(
     harness_env_only: bool = False,
     tests_only: bool = False,
 ) -> str:
-  pkgs = _go_packages_from_targets(targets)
-  pkg_args = " ".join(f'"{p}"' for p in pkgs)
-  return (
-      _common_header(
-          repo_dir=repo_dir,
-          skip_install=skip_install,
-          harness_conda=harness_conda,
-          harness_env_only=harness_env_only,
-          tests_only=tests_only,
-      )
-      + _empty_junit_both()
-      + f'GO_PKGS="{pkg_args}"\n'
-      + _apply_one_fn()
-      + r"""echo "[docker] go test (base + test_patch only) $GO_PKGS" >&2
+    from .go_build import resolve_go_test_invocation
+
+    cfg = install_config if isinstance(install_config, dict) else {}
+    go_test_cmd = resolve_go_test_invocation(cfg.get("test_cmd"), targets)
+    return (
+        _common_header(
+            repo_dir=repo_dir,
+            skip_install=skip_install,
+            harness_conda=harness_conda,
+            harness_env_only=harness_env_only,
+            tests_only=tests_only,
+        )
+        + _empty_junit_both()
+        + f'GO_TEST_CMD="{_sh_escape_double(go_test_cmd)}"\n'
+        + _apply_one_fn()
+        + r"""echo "[docker] go test (base + test_patch only) $GO_TEST_CMD" >&2
 _apply_one /w/test.patch || exit 1
-go test -v -count=1 $GO_PKGS > /w/test-base.log 2>&1 || true
+eval "$GO_TEST_CMD" > /w/test-base.log 2>&1 || true
 echo "[docker] reset to base_commit" >&2
 git reset --hard "${SWEBENCH_BASE_COMMIT:-HEAD}"
 git clean -ffdx 2>/dev/null || true
-echo "[docker] go test (test_patch + impl.patch) $GO_PKGS" >&2
+echo "[docker] go test (test_patch + impl.patch) $GO_TEST_CMD" >&2
 _apply_one /w/test.patch || exit 1
 _apply_one /w/impl.patch || exit 1
-go test -v -count=1 $GO_PKGS > /w/test-patch.log 2>&1 || true
+eval "$GO_TEST_CMD" > /w/test-patch.log 2>&1 || true
 """
-      + (_pip_freeze_block() if run_pip_freeze else "")
-  )
+        + (_pip_freeze_block() if run_pip_freeze else "")
+    )
 
 
 def _rust_cargo_features_block(install_config: dict[str, Any]) -> str:
@@ -902,8 +1041,73 @@ _run_php_tests /w/junit-patch.xml
     )
 
 
+def _ruby_rspec_run_block() -> str:
+    return r"""_ruby_ensure_junit_formatter() {
+  if bundle exec ruby -e "require 'rspec_junit_formatter'" 2>/dev/null; then
+    return 0
+  fi
+  echo "[docker] installing rspec_junit_formatter" >&2
+  gem install rspec_junit_formatter -N 2>/dev/null || true
+  bundle add --group test rspec_junit_formatter 2>/dev/null || true
+}
+_run_ruby_tests() {
+  local junit_out="$1"
+  local log_out="$2"
+  _ruby_ensure_junit_formatter
+  echo "[docker] rspec ${#T[@]} path(s) -> $junit_out" >&2
+  if [[ ${#T[@]} -gt 0 ]]; then
+    bundle exec rspec "${T[@]}" --format RspecJunitFormatter --out "$junit_out" \
+      2>&1 | tee "$log_out" || true
+  else
+    bundle exec rspec --format RspecJunitFormatter --out "$junit_out" \
+      2>&1 | tee "$log_out" || true
+  fi
+  python3 /w/empty_junit_if_missing.py "$junit_out" "$log_out" || true
+}
+"""
+
+
+def _ruby_minitest_run_block() -> str:
+    return r"""_ruby_ensure_minitest_junit() {
+  gem install minitest-reporters -N 2>/dev/null || true
+}
+_run_ruby_tests() {
+  local junit_out="$1"
+  local log_out="$2"
+  _ruby_ensure_minitest_junit
+  echo "[docker] minitest ${#T[@]} path(s) -> $junit_out" >&2
+  if [[ ${#T[@]} -gt 0 ]]; then
+    bundle exec ruby /w/minitest_junit_runner.rb "${T[@]}" "$junit_out" \
+      2>&1 | tee "$log_out" || true
+  elif [[ -f Rakefile ]] && grep -qE '\btest\b' Rakefile 2>/dev/null; then
+    bundle exec rake test 2>&1 | tee "$log_out" || true
+    python3 /w/minitest_harvest_junit.py "$junit_out" "$log_out" || true
+  else
+    bundle exec ruby -Itest /w/minitest_junit_runner.rb test "$junit_out" \
+      2>&1 | tee "$log_out" || true
+  fi
+  python3 /w/empty_junit_if_missing.py "$junit_out" "$log_out" || true
+}
+"""
+
+
+def _ruby_two_phase_tail(runner_label: str) -> str:
+    return rf"""echo "[docker] {runner_label} (base + test_patch only)" >&2
+_apply_one /w/test.patch || exit 1
+_run_ruby_tests /w/junit-base.xml /w/test-base.log
+echo "[docker] reset to base_commit" >&2
+git reset --hard "${{SWEBENCH_BASE_COMMIT:-HEAD}}"
+git clean -ffdx 2>/dev/null || true
+echo "[docker] {runner_label} (test_patch + impl.patch)" >&2
+_apply_one /w/test.patch || exit 1
+_apply_one /w/impl.patch || exit 1
+_run_ruby_tests /w/junit-patch.xml /w/test-patch.log
+"""
+
+
 def _ruby_body(
     run_pip_freeze: bool,
+    install_config: dict[str, Any] | None = None,
     *,
     repo_dir: str = "/w/repo",
     skip_install: bool = False,
@@ -911,6 +1115,12 @@ def _ruby_body(
     harness_env_only: bool = False,
     tests_only: bool = False,
 ) -> str:
+    from .ruby_build import runner_from_install_config
+
+    cfg = install_config if isinstance(install_config, dict) else {}
+    runner = runner_from_install_config(cfg)
+    run_block = _ruby_minitest_run_block() if runner == "minitest" else _ruby_rspec_run_block()
+    label = "minitest" if runner == "minitest" else "rspec"
     return (
         _common_header(
             repo_dir=repo_dir,
@@ -920,25 +1130,10 @@ def _ruby_body(
             tests_only=tests_only,
         )
         + _empty_junit_both()
-        + r"""_run_rspec() {
-  local junit_out="$1"
-  local log_out="$2"
-  echo "[docker] rspec ${#T[@]} path(s) -> $junit_out" >&2
-  if [[ ${#T[@]} -gt 0 ]]; then
-    bundle exec rspec "${T[@]}" --format RspecJunitFormatter --out "$junit_out" \
-      2>&1 | tee "$log_out" || true
-  else
-    bundle exec rspec --format RspecJunitFormatter --out "$junit_out" \
-      2>&1 | tee "$log_out" || true
-  fi
-}
-echo "[docker] rspec (before patch)" >&2
-_run_rspec /w/junit-base.xml /w/test-base.log
-"""
-        + _apply_patches_block()
-        + r"""echo "[docker] rspec (after patch)" >&2
-_run_rspec /w/junit-patch.xml /w/test-patch.log
-"""
+        + f'RUBY_TEST_RUNNER="{runner}"\n'
+        + _apply_one_fn()
+        + run_block
+        + _ruby_two_phase_tail(label)
         + (_pip_freeze_block() if run_pip_freeze else "")
     )
 
@@ -1176,10 +1371,37 @@ ET.ElementTree(root).write(out)
 '''
 
 
+MINITEST_JUNIT_RUNNER_RB = r"""#!/usr/bin/env ruby
+# Load scoped Minitest files with JUnit output (discover + harness).
+require 'minitest/autorun'
+require 'minitest/reporters'
+
+junit_out = ARGV.pop
+files = ARGV.reject(&:empty?)
+Minitest::Reporters.use! Minitest::Reporters::JUnitReporter.new(junit_out)
+files.each { |f| load f }
+"""
+
+MINITEST_HARVEST_JUNIT_PY = r'''
+import sys
+from pathlib import Path
+import xml.etree.ElementTree as ET
+
+out, log = Path(sys.argv[1]), Path(sys.argv[2])
+if out.is_file() and out.stat().st_size > 50:
+    raise SystemExit(0)
+root = ET.Element("testsuites")
+ET.SubElement(root, "testsuite", {"name": "minitest", "tests": "0"})
+ET.ElementTree(root).write(out)
+'''
+
+
 def write_helper_scripts(work: Path) -> None:
     (work / "merge_junit.py").write_text(MERGE_JUNIT_PY.strip() + "\n", encoding="utf-8")
     (work / "harvest_jest_junit.py").write_text(HARVEST_JEST_JUNIT_PY.strip() + "\n", encoding="utf-8")
     (work / "empty_junit_if_missing.py").write_text(EMPTY_JUNIT_PY.strip() + "\n", encoding="utf-8")
+    (work / "minitest_junit_runner.rb").write_text(MINITEST_JUNIT_RUNNER_RB.strip() + "\n", encoding="utf-8")
+    (work / "minitest_harvest_junit.py").write_text(MINITEST_HARVEST_JUNIT_PY.strip() + "\n", encoding="utf-8")
 
 
 def write_entry_script(
@@ -1225,7 +1447,7 @@ def write_entry_script(
             body = _python_body(install_config, run_pip_freeze, **body_kw)
         _write_python_install_bundle(work, install_config, repo_dir=repo_dir)
     elif lang.id == "go":
-        body = _go_body(targets, run_pip_freeze, **body_kw)
+        body = _go_body(targets, run_pip_freeze, install_config, **body_kw)
         _write_generic_install_bundle(work, install_config, include_pip=False, repo_dir=repo_dir)
     elif lang.id == "rust":
         body = _rust_body(install_config, run_pip_freeze, **body_kw)
@@ -1240,7 +1462,7 @@ def write_entry_script(
         body = _php_body(run_pip_freeze, **body_kw)
         _write_generic_install_bundle(work, install_config, include_pip=False, repo_dir=repo_dir)
     elif lang.id == "ruby":
-        body = _ruby_body(run_pip_freeze, **body_kw)
+        body = _ruby_body(run_pip_freeze, install_config, **body_kw)
         _write_generic_install_bundle(work, install_config, include_pip=False, repo_dir=repo_dir)
     elif lang.id == "c":
         body = _c_body(run_pip_freeze, install_config, **body_kw)

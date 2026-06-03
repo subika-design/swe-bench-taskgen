@@ -75,7 +75,9 @@ def php_install_config_for_repo(
     cfg = dict(base or get_language_spec("php").default_install_config)
     cfg["language"] = "php"
     cfg = ensure_php_docker_specs(cfg, repo=repo, language="php")
-    cfg = merge_apt_into_config(cfg, list(_PHP_APT_BASE))
+    from .manifest_extract import composer_ext_apt_packages
+
+    cfg = merge_apt_into_config(cfg, list(_PHP_APT_BASE) + composer_ext_apt_packages(repo))
     cfg["install"] = "composer install --no-interaction --prefer-dist --no-progress || true"
     from .repo_detect import repo_uses_artisan_phpunit
 

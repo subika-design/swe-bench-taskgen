@@ -323,20 +323,17 @@ def _env_apt_setup_commands(specs, requirements_text: str | None = None) -> list
 
     ``pre_install`` in specs runs in the *instance* image; env image must install these first.
     """
-    deb: list[str] = []
-    apt_pkgs = specs.get("apt-pkgs")
-    if isinstance(apt_pkgs, list) and apt_pkgs:
-        deb = [str(p) for p in apt_pkgs if p]
-    elif requirements_text:
+    from swe_rebench_pr.harness.test_spec.utils import env_apt_setup_commands
+
+    if specs.get("apt-pkgs") or specs.get("apt-pkgs-optional"):
+        return env_apt_setup_commands(specs)
+    if requirements_text:
         from swe_rebench_pr.swebench_align import apt_debian_packages_for_requirements_text
 
         deb = apt_debian_packages_for_requirements_text(requirements_text)
-    if not deb:
-        return []
-    return [
-        "apt-get update -qq",
-        f"apt-get install -y --no-install-recommends {' '.join(deb)}",
-    ]
+        if deb:
+            return env_apt_setup_commands({"apt-pkgs": deb})
+    return []
 
 
 def make_env_script_list_py_from_conda(

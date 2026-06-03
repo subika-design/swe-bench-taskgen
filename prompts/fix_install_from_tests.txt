@@ -11,6 +11,9 @@ The harness runs **only** what is in `install_config` (no hidden steps). Replay 
 Current installation configuration:
 {{install_config}}
 
+CI / Docker context (prefer these commands when fixing install/test_cmd):
+{{ci_context}}
+
 Install / Docker logs and pytest diagnostics:
 {{cut_logs}}
 

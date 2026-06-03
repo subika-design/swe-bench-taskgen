@@ -30,3 +30,17 @@ def test_filter_f2p_drops_unrelated_java_tests():
     ]
     f2p = ["org/springframework/boot/build/OtherTests.py::x()"]
     assert _filter_f2p_to_test_patch_scope(f2p, tp, "java") == []
+
+
+def test_filter_f2p_keeps_native_integration_nodeids():
+    tp = ["tests/http/test_60_h3_proxy.py"]
+    f2p = [
+        "test_60_h3_proxy/TestH3ProxyConnectionManagement.py::test_60_10_proxy_basic_auth"
+    ]
+    kept = _filter_f2p_to_test_patch_scope(
+        f2p,
+        tp,
+        "python",
+        native_integration_pytest_root="tests/http",
+    )
+    assert kept == f2p

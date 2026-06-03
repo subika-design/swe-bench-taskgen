@@ -1,5 +1,5 @@
-# Optional per-repo install/test overrides (applied after artifact detection).
+# Optional per-repo install/test overrides (applied after CI + manifest + heuristics).
 # Keys are GitHub ``owner/name`` slugs.
 #
-# Prefer artifact-based hints in repo_detect.py (snapshots, Jest/Mocha, meson, …).
-# Add entries here only when checkout detection cannot express the fix.
+# Pipeline order: CI/workflows → manifests → language heuristics → LLM refine → sanitize → overrides.
+# Prefer repo_detect.py / ci_extract.py for automatic fixes; add entries here for stubborn repos.

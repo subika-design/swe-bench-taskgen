@@ -44,10 +44,42 @@ def test_remediate_ruby_version_mismatch():
 def test_ruby_body_passes_targets_to_rspec():
     from swe_rebench_pr.docker_entry import _ruby_body
 
-    body = _ruby_body(False, repo_dir="/testbed")
-    assert '_run_rspec' in body
+    body = _ruby_body(False, {"ruby_test_runner": "rspec"}, repo_dir="/testbed")
+    assert "_run_ruby_tests" in body
     assert 'bundle exec rspec "${T[@]}"' in body
     assert "RspecJunitFormatter" in body
+    assert "base + test_patch only" in body
+    assert "test_patch + impl.patch" in body
+    assert "reset to base_commit" in body
+    assert "_ruby_ensure_junit_formatter" in body
+    assert "empty_junit_if_missing.py" in body
+
+
+def test_ruby_body_minitest_runner():
+    from swe_rebench_pr.docker_entry import _ruby_body
+
+    body = _ruby_body(False, {"ruby_test_runner": "minitest"}, repo_dir="/testbed")
+    assert 'RUBY_TEST_RUNNER="minitest"' in body
+    assert "/w/minitest_junit_runner.rb" in body
+    assert "_ruby_ensure_minitest_junit" in body
+
+
+def test_detect_ruby_test_runner_spec_vs_test(tmp_path: Path):
+    from swe_rebench_pr.ruby_build import detect_ruby_test_runner
+
+    (tmp_path / "spec").mkdir()
+    (tmp_path / "spec" / "spec_helper.rb").write_text("", encoding="utf-8")
+    assert detect_ruby_test_runner(tmp_path, ["spec/foo_spec.rb"]) == "rspec"
+    (tmp_path / "test").mkdir(exist_ok=True)
+    assert detect_ruby_test_runner(tmp_path, ["test/models/user_test.rb"]) == "minitest"
+
+
+def test_export_install_config_includes_ruby_test_runner():
+    out = export_install_config_for_harness(
+        {"language": "ruby", "install": "bundle install", "ruby_test_runner": "rspec"},
+        language="ruby",
+    )
+    assert out["ruby_test_runner"] == "rspec"
 
 
 def test_ensure_rust_docker_specs_from_toolchain(tmp_path: Path):

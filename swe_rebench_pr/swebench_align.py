@@ -55,6 +55,15 @@ INTERNAL_INSTALL_KEYS: frozenset[str] = frozenset(
         "c_build_system",
         "result_format",
         "premake_test_cmd_base",
+        "native_integration_build",
+        "native_integration_pytest_root",
+        "native_integration_repo_dir",
+        "native_integration_cmake_pytest_target",
+        "apt-pkgs-optional",
+        "_ci_excerpt",
+        "native_integration_setup",
+        "js_test_runner",
+        "ruby_test_runner",
     }
 )
 _INTERNAL_INSTALL_KEYS = INTERNAL_INSTALL_KEYS
@@ -323,6 +332,14 @@ def export_install_config_for_harness(
             if not isinstance(val, list) or not val:
                 continue
         out[key] = val
+    if lang in ("javascript", "js", "node", "typescript", "ts"):
+        jr = str(cfg.get("js_test_runner") or "").strip().lower()
+        if jr in ("jest", "vitest", "mocha"):
+            out["js_test_runner"] = jr
+    if lang in ("ruby", "rb"):
+        rr = str(cfg.get("ruby_test_runner") or "").strip().lower()
+        if rr in ("rspec", "minitest"):
+            out["ruby_test_runner"] = rr
     return out
 
 

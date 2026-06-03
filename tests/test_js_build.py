@@ -751,6 +751,90 @@ def test_yarn_lock_repo_uses_yarn_install(tmp_path: Path):
     assert any("yarn" in ln for ln in (cfg.get("pre_install") or []))
 
 
+def test_detect_makefile_mocha_runner_eslint_like(tmp_path: Path):
+    (tmp_path / "Makefile.js").write_text(
+        'const MOCHA = `${NODE_MODULES}mocha/bin/_mocha `;\n'
+        "target.mocha = () => { exec(`${getBinFile('c8')} -- ${MOCHA}`); };\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": "node Makefile.js test"}, "devDependencies": {"mocha": "^11.0.0"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "tests" / "fixtures" / "broken").mkdir(parents=True)
+    (tmp_path / "tests" / "fixtures" / "broken" / "package.json").write_text("{ not json", encoding="utf-8")
+    (tmp_path / "tests" / "fixtures" / "bom" / "package.json").write_text("{ not json", encoding="utf-8")
+    (tmp_path / "tests" / "fixtures" / "other" / "package.json").write_text("{}", encoding="utf-8")
+    assert detect_js_test_runner(tmp_path, ["tests/lib/rules/foo.js"]) == "mocha"
+
+
+def test_merge_js_makefile_repo_uses_mocha_not_jest(tmp_path: Path):
+    (tmp_path / "Makefile.js").write_text(
+        "const MOCHA = 'mocha';\n target.mocha = function() {};\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": "node Makefile.js test"}, "devDependencies": {"mocha": "^11.0.0", "c8": "^10.0.0"}}),
+        encoding="utf-8",
+    )
+    for sub in ("broken", "bom", "other"):
+        d = tmp_path / "tests" / "fixtures" / sub
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "package.json").write_text("{", encoding="utf-8")
+    cfg = merge_js_build_into_config(
+        {"test_cmd": "node Makefile.js mocha"},
+        tmp_path,
+        ["tests/lib/rules/foo.js"],
+    )
+    assert cfg.get("js_test_runner") == "mocha"
+    cmd = str(cfg["test_cmd"]).lower()
+    assert "jest" not in cmd
+    assert "mocha" in cmd
+    assert "tests/lib/rules/foo.js" in str(cfg["test_cmd"])
+
+
+def test_remediate_haste_map_switches_to_mocha(tmp_path: Path):
+    from swe_rebench_pr.js_build import remediate_js_jest_haste_to_mocha
+
+    (tmp_path / "Makefile.js").write_text("target.mocha = () => {};\n", encoding="utf-8")
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": "node Makefile.js test"}, "devDependencies": {"mocha": "^11.0.0"}}),
+        encoding="utf-8",
+    )
+    log = "jest-haste-map: Cannot parse /testbed/tests/fixtures/config-file/bom/package.json as JSON"
+    out = remediate_js_install_from_log(
+        {
+            "js_test_runner": "jest",
+            "test_cmd": "cd /testbed && npx jest tests/lib/rules/foo.js",
+        },
+        log,
+        repo=tmp_path,
+        test_paths=["tests/lib/rules/foo.js"],
+    )
+    assert out.get("js_test_runner") == "mocha"
+    assert "jest" not in str(out.get("test_cmd") or "").lower()
+    assert "mocha" in str(out.get("test_cmd") or "").lower()
+
+    direct = remediate_js_jest_haste_to_mocha(
+        {"test_cmd": "npx jest foo.js"},
+        tmp_path,
+        ["tests/lib/rules/foo.js"],
+    )
+    assert direct.get("js_test_runner") == "mocha"
+
+
+def test_ci_extract_prefers_makefile_mocha():
+    from swe_rebench_pr.ci_extract import _pick_best_line, _TEST_SCORES
+
+    lines = [
+        "npx jest --ci",
+        "node Makefile.js mocha",
+        "npm test",
+    ]
+    best = _pick_best_line(lines, _TEST_SCORES)
+    assert best == "node Makefile.js mocha"
+
+
 def test_remediate_js_install_eunsupportedprotocol(tmp_path: Path):
     (tmp_path / "package.json").write_text(
         json.dumps(

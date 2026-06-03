@@ -126,7 +126,11 @@ def _language_notes(language: str, repo_id: str, *, repo: Path | None = None) ->
     if lang == "python":
         return "- Use pytest `def test_*` under `tests/`.\n"
     if lang == "go":
-        return "- Use `*_test.go` in the package under test.\n"
+        return (
+            "- Add or modify tests in `*_test.go` under the package under test.\n"
+            "- SWE-bench grading keys are exact `go test -v` names: `TestFoo` or "
+            "`TestFoo/subtest` (not file paths).\n"
+        )
     return ""
 
 
@@ -507,6 +511,12 @@ def llm_fix_test_patch_from_docker_tests(
             "(`--tests '<fqcn>'` on the listed project). "
             "JUnit keys must match your test_patch file path / public class — "
             "not `org.springframework.boot.build.*` plugin tests."
+        )
+    elif (language or "").lower() == "go":
+        runner_note = (
+            "The harness runs `go test -v` (scoped packages or CI `-run` from install_config). "
+            "FAIL_TO_PASS / grading keys are exact gotest names: `TestFoo` or `TestFoo/subtest`, "
+            "not `*_test.go` file paths."
         )
     else:
         runner_note = (

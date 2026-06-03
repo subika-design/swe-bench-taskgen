@@ -798,6 +798,9 @@ def install_config_affects_env_image(cfg: dict[str, Any]) -> dict[str, Any]:
         "reqs_path",
         "python",
         "apt-pkgs",
+        "apt-pkgs-optional",
+        "install",
+        "post_install",
     )
     return {k: cfg.get(k) for k in keys if k in cfg}
 
