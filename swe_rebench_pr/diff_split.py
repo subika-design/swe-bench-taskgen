@@ -152,12 +152,18 @@ def split_impl_and_test_patch(
         return path_roles.get(p.replace("\\", "/"))
 
     def is_test_hunk(path_a: str, path_b: str) -> bool:
+        from .patch_paths import is_gradable_test_path, is_non_test_infrastructure_path
+
+        if is_non_test_infrastructure_path(path_a) or is_non_test_infrastructure_path(
+            path_b
+        ):
+            return False
         ra, rb = role_for(path_a), role_for(path_b)
         if ra == "test" or rb == "test":
-            return True
+            return is_gradable_test_path(path_a) or is_gradable_test_path(path_b)
         if ra == "impl" and rb == "impl":
-            return _heuristic_test_path(path_a) or _heuristic_test_path(path_b)
-        return _heuristic_test_path(path_a) or _heuristic_test_path(path_b)
+            return is_gradable_test_path(path_a) or is_gradable_test_path(path_b)
+        return is_gradable_test_path(path_a) or is_gradable_test_path(path_b)
 
     for path_a, path_b, ch in chunks:
         if is_test_hunk(path_a, path_b):
@@ -552,6 +558,23 @@ def _nodeid_in_test_patch_paths(
 
             if rspec_junit_nodeid_in_test_patch_paths(nodeid, list(test_patch_paths)):
                 return True
+        if language.lower() == "php" and test_patch_paths:
+            from .php_build import php_junit_nodeid_in_test_patch_paths
+
+            if php_junit_nodeid_in_test_patch_paths(nodeid, list(test_patch_paths)):
+                return True
+        if language.lower() in ("python", "py") and test_patch_paths:
+            from .python_build import pytest_junit_nodeid_in_test_patch_paths
+
+            if pytest_junit_nodeid_in_test_patch_paths(
+                nodeid, list(test_patch_paths), test_patch=test_patch
+            ):
+                return True
+        if language.lower() == "c" and test_patch_paths:
+            from .runtests_build import runtests_log_key_in_test_patch_paths
+
+            if runtests_log_key_in_test_patch_paths(nodeid, list(test_patch_paths)):
+                return True
     if " > " in nodeid:
         class_part = nodeid.split(" > ", 1)[0].strip()
         if java_fqcns and class_part in java_fqcns:
@@ -630,6 +653,13 @@ def has_test_patch_label_mismatch(
         return not any(_case_map_key_matches_paths(key, labels) for key in case_map)
     from .languages import get_language_spec
 
+    if language and get_language_spec(language).id == "c":
+        from .runtests_build import runtests_log_key_in_test_patch_paths
+
+        if any(
+            runtests_log_key_in_test_patch_paths(nid, test_patch_paths) for nid in case_map
+        ):
+            return False
     if language:
         spec = get_language_spec(language)
         if spec.result_format == "cargo_log":
@@ -652,6 +682,24 @@ def has_test_patch_label_mismatch(
 
             if any(
                 rspec_junit_nodeid_in_test_patch_paths(nid, test_patch_paths)
+                for nid in case_map
+            ):
+                return False
+        if language.lower() == "php":
+            from .php_build import php_junit_nodeid_in_test_patch_paths
+
+            if any(
+                php_junit_nodeid_in_test_patch_paths(nid, test_patch_paths)
+                for nid in case_map
+            ):
+                return False
+        if language.lower() in ("python", "py"):
+            from .python_build import pytest_junit_nodeid_in_test_patch_paths
+
+            if any(
+                pytest_junit_nodeid_in_test_patch_paths(
+                    nid, test_patch_paths, test_patch=test_patch
+                )
                 for nid in case_map
             ):
                 return False

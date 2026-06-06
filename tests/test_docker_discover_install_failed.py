@@ -46,7 +46,7 @@ def test_python_native_integration_exit1_with_pytest_not_install_failure():
     )
 
 
-def test_python_native_integration_exit1_patch_apply_still_install_failure():
+def test_python_native_integration_exit1_patch_apply_not_install_failure():
     assert (
         _docker_install_failed(
             docker_exit=1,
@@ -57,7 +57,7 @@ def test_python_native_integration_exit1_patch_apply_still_install_failure():
             install_config={"language": "python", "native_integration_build": True},
             lang="python",
         )
-        is True
+        is False
     )
 
 

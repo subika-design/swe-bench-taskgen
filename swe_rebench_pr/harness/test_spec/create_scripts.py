@@ -1,6 +1,12 @@
 from swe_rebench_pr.harness.constants import (
     MAP_REPO_TO_EXT,
-    REPO_BASE_COMMIT_BRANCH,
+)
+from swe_rebench_pr.harness.git_clone_cmds import (
+    git_clone_branch_arg,
+    git_fetch_and_reset_commands,
+    git_post_reset_hygiene_commands,
+    python_conda_activate_commands,
+    python_swebench_marker_commands,
 )
 from swe_rebench_pr.harness.test_spec.javascript import (
     make_eval_script_list_js,
@@ -42,29 +48,17 @@ def make_repo_clone_script_list(
     """
     ext = MAP_REPO_TO_EXT[repo]
     if ext == "py":
-        branch = REPO_BASE_COMMIT_BRANCH.get(repo, {}).get(base_commit, "")
-        branch = f"--branch {branch}" if branch else ""
+        branch = git_clone_branch_arg(repo, base_commit)
         return [
             *_clear_repo_directory_commands(repo_directory),
             f"git clone -o origin {branch} --single-branch https://github.com/{repo} {repo_directory}",
             f"chmod -R 777 {repo_directory}",
             *_git_safe_directory_commands(repo_directory),
             f"cd {repo_directory}",
-            f"git reset --hard {base_commit}",
-            "git remote remove origin",
-            f"TARGET_TIMESTAMP=$(git show -s --format=%ci {base_commit})",
-            'git tag -l | while read tag; do TAG_COMMIT=$(git rev-list -n 1 "$tag"); TAG_TIME=$(git show -s --format=%ci "$TAG_COMMIT"); if [[ "$TAG_TIME" > "$TARGET_TIMESTAMP" ]]; then git tag -d "$tag"; fi; done',
-            "git reflog expire --expire=now --all",
-            "git gc --prune=now --aggressive",
-            "AFTER_TIMESTAMP=$(date -d \"$TARGET_TIMESTAMP + 1 second\" '+%Y-%m-%d %H:%M:%S')",
-            'COMMIT_COUNT=$(git log --oneline --all --since="$AFTER_TIMESTAMP" | wc -l)',
-            '[ "$COMMIT_COUNT" -eq 0 ] || exit 1',
-            "source /opt/miniconda3/bin/activate",
-            f"conda activate {env_name}",
-            'echo "Current environment: $CONDA_DEFAULT_ENV"',
-            "git config --global user.email setup@swebench.config",
-            "git config --global user.name SWE-bench",
-            "git commit --allow-empty -am SWE-bench",
+            *git_fetch_and_reset_commands(base_commit),
+            *git_post_reset_hygiene_commands(base_commit),
+            *python_conda_activate_commands(env_name),
+            *python_swebench_marker_commands(),
         ]
     return [
         *_clear_repo_directory_commands(repo_directory),
@@ -72,7 +66,7 @@ def make_repo_clone_script_list(
         f"chmod -R 777 {repo_directory}",
         *_git_safe_directory_commands(repo_directory),
         f"cd {repo_directory}",
-        f"git reset --hard {base_commit}",
+        *git_fetch_and_reset_commands(base_commit),
         "git remote remove origin",
     ]
 

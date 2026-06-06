@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .builder import build_row, row_to_jsonl_line
 from .gh_pr import parse_pr_url
+from .task_type import TASK_TYPE_SKIP, is_gradable_task_type
 from .llm_client import DEFAULT_LLM_MODEL, is_anthropic_model, resolve_llm_api_key
 from .swebench_align import repair_jsonl_file
 
@@ -295,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     ok = 0
+    skipped_early = 0
     skipped_f2p = 0
     skipped_not_gradable = 0
 
@@ -329,9 +331,16 @@ def main(argv: list[str] | None = None) -> int:
                     force_rebuild_harness_images=bool(args.force_rebuild_harness_images),
                     build_instance_harness_images=bool(args.build_instance_images),
                 )
-                tt = row.get("task_type", "")
-                if discover_docker and not tt:
-                    if _fail_to_pass_len(row) < 1:
+                tt = str(row.get("task_type") or "")
+                if discover_docker and not is_gradable_task_type(tt):
+                    if tt == TASK_TYPE_SKIP:
+                        skipped_early += 1
+                        print(
+                            f"# skip {pr.instance_id}: not written "
+                            f"(patches do not apply at base_commit)",
+                            file=sys.stderr,
+                        )
+                    elif _fail_to_pass_len(row) < 1:
                         skipped_f2p += 1
                         print(
                             f"# skip {pr.instance_id}: not written "
@@ -355,6 +364,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"# skip {url!r}: {e}", file=sys.stderr)
 
     print(f"# wrote {ok}/{len(urls)} rows -> {args.output}", file=sys.stderr)
+    if discover_docker and skipped_early:
+        print(
+            f"# skipped {skipped_early} row(s) with task_type=skip (patch apply at base)",
+            file=sys.stderr,
+        )
     if discover_docker and skipped_f2p:
         print(f"# skipped {skipped_f2p} row(s) with empty FAIL_TO_PASS", file=sys.stderr)
     if discover_docker and skipped_not_gradable:

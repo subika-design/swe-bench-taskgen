@@ -9,8 +9,12 @@ from typing import Any, Iterable
 from .apt_from_log import ensure_base_build_apt, merge_apt_into_config, remediate_apt_install_from_log
 
 DEFAULT_RUST_VERSION = "1.81-bookworm"
+# Minimum toolchain for ``edition = "2024"`` manifests (e.g. ripgrep at rust-version 1.85).
+EDITION_2024_MIN_RUST_VERSION = "1.85-bookworm"
 
 _RUST_APT_BASE = ("libssl-dev", "pkg-config")
+_CARGO_RUST_VERSION_RE = re.compile(r'rust-version\s*=\s*"([^"]+)"', re.MULTILINE)
+_CARGO_EDITION_RE = re.compile(r'edition\s*=\s*"(\d{4})"', re.MULTILINE)
 
 _CFG_FEATURE_RE = re.compile(
     r"#!\[cfg\(feature\s*=\s*\"([^\"]+)\"\)\]|#\[cfg\(feature\s*=\s*\"([^\"]+)\"\)\]"
@@ -32,7 +36,40 @@ def _normalize_rust_version(raw: str) -> str:
     return DEFAULT_RUST_VERSION
 
 
+def _max_rust_version(a: str, b: str) -> str:
+    """Pick the newer of two ``major.minor-bookworm`` tags."""
+    def key(v: str) -> tuple[int, int]:
+        m = re.fullmatch(r"(\d+)\.(\d+)(?:\.\d+)?-bookworm", v.strip())
+        if not m:
+            return (0, 0)
+        return (int(m.group(1)), int(m.group(2)))
+
+    return a if key(a) >= key(b) else b
+
+
+def resolve_rust_version_from_cargo_toml(repo: Path) -> str | None:
+    """Read ``rust-version`` / ``edition`` from ``Cargo.toml`` (package or workspace)."""
+    cargo = repo / "Cargo.toml"
+    if not cargo.is_file():
+        return None
+    try:
+        text = cargo.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    rv: str | None = None
+    m = _CARGO_RUST_VERSION_RE.search(text)
+    if m:
+        rv = _normalize_rust_version(m.group(1).strip())
+    for em in _CARGO_EDITION_RE.finditer(text):
+        if int(em.group(1)) >= 2024:
+            rv = _max_rust_version(rv or DEFAULT_RUST_VERSION, EDITION_2024_MIN_RUST_VERSION)
+    return rv
+
+
 def resolve_rust_version_for_repo(repo: Path) -> str | None:
+    from_cargo = resolve_rust_version_from_cargo_toml(repo)
+    if from_cargo:
+        return from_cargo
     toolchain = repo / "rust-toolchain.toml"
     if toolchain.is_file():
         try:
@@ -229,6 +266,36 @@ def rust_install_config_for_repo(
     return cfg
 
 
+def log_indicates_rust_manifest_parse_failure(log: str) -> bool:
+    low = (log or "").lower()
+    return "failed to parse manifest" in low and "cargo.toml" in low
+
+
+def remediate_rust_version_from_log(
+    cfg: dict[str, Any],
+    log: str,
+    *,
+    repo: Path | None = None,
+) -> dict[str, Any]:
+    """Bump ``docker_specs.rust_version`` when Cargo rejects the manifest."""
+    if not log_indicates_rust_manifest_parse_failure(log):
+        return cfg
+    out = dict(cfg)
+    specs = dict(out.get("docker_specs") or {}) if isinstance(out.get("docker_specs"), dict) else {}
+    current = str(specs.get("rust_version") or DEFAULT_RUST_VERSION)
+    bumped = current
+    if repo is not None:
+        from_repo = resolve_rust_version_from_cargo_toml(repo) or resolve_rust_version_for_repo(repo)
+        if from_repo:
+            bumped = _max_rust_version(current, from_repo)
+    if bumped == current and "edition" in log.lower():
+        bumped = _max_rust_version(current, EDITION_2024_MIN_RUST_VERSION)
+    if bumped != current:
+        specs["rust_version"] = bumped
+        out["docker_specs"] = specs
+    return out
+
+
 def remediate_rust_install_from_log(
     cfg: dict[str, Any],
     log: str,
@@ -238,6 +305,7 @@ def remediate_rust_install_from_log(
 ) -> dict[str, Any]:
     out = remediate_apt_install_from_log(cfg, log)
     out = merge_apt_into_config(out, list(_RUST_APT_BASE))
+    out = remediate_rust_version_from_log(out, log, repo=repo)
     low = log.lower()
     zero_tests = "running 0 tests" in low or (
         "test result:" in low and "0 passed" in low and "0 failed" in low

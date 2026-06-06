@@ -9,13 +9,14 @@ from typing import Any, Optional
 
 from .diff_split import split_impl_and_test_patch
 from .docker_discover import discover_fail_to_pass_pass_to_pass_docker
-from .gh_pr import ParsedPR, clone_repo_at, fetch_pr_diff, fetch_pr_metadata
+from .gh_pr import ParsedPR, clone_repo_at, fetch_pr_diff, fetch_pr_metadata, validate_base_commit_reachable
 from .install_config_build import build_install_config_for_repo
 from .install_llm import llm_fix_recipe
 from .env_setup import try_pip_install_and_freeze
 from .issues import build_problem_and_hints
 from .schema import OUTPUT_KEYS
 from .swebench_align import repair_jsonl_row_for_harness
+from .task_type import TASK_TYPE_SKIP
 from .languages import (
     detect_language_from_changed_paths,
     detect_language_from_patches,
@@ -24,6 +25,41 @@ from .languages import (
     normalize_language,
 )
 from .versioning import harness_version_for_instance, normalized_install_version
+
+
+def _builder_skip_row(
+    pr: ParsedPR,
+    meta,
+    *,
+    patch: str,
+    test_patch: str,
+    problem: str,
+    hints: str,
+    version: str,
+    task_language: str,
+    install_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    row = {
+        "instance_id": pr.instance_id,
+        "patch": patch,
+        "repo": pr.repo_id,
+        "base_commit": meta.base_commit,
+        "head_commit": meta.head_commit,
+        "hints_text": hints,
+        "created_at": meta.created_at,
+        "test_patch": test_patch,
+        "problem_statement": problem,
+        "version": version,
+        "environment_setup_commit": meta.base_commit,
+        "FAIL_TO_PASS": json.dumps([]),
+        "PASS_TO_PASS": json.dumps([]),
+        "task_type": TASK_TYPE_SKIP,
+        "language": task_language,
+        "install_config": install_cfg,
+        "requirements": "",
+        "environment": "",
+    }
+    return repair_jsonl_row_for_harness(row)
 
 
 def resolve_task_language(
@@ -122,19 +158,85 @@ def build_row(
     try:
         repo = work / "repo"
         clone_repo_at(pr, repo, meta.base_commit, depth=clone_depth, timeout=clone_timeout)
-        from .patch_validate import ensure_valid_patch_split
-
-        patch, test_patch = ensure_valid_patch_split(
-            pr,
-            repo,
-            diff,
-            patch,
-            test_patch,
-            llm_split_used=llm_patch_split is not None,
+        validate_base_commit_reachable(repo, meta.base_commit)
+        from .patch_validate import (
+            PatchSplitUnrecoverableError,
+            ensure_patch_commits_fetched,
+            ensure_valid_patch_split,
         )
+
+        ensure_patch_commits_fetched(repo, meta.base_commit, meta.head_commit)
+        try:
+            patch, test_patch = ensure_valid_patch_split(
+                pr,
+                repo,
+                diff,
+                patch,
+                test_patch,
+                base_commit=meta.base_commit,
+                head_sha=meta.head_commit,
+                llm_split_used=llm_patch_split is not None,
+                language=task_language,
+            )
+        except PatchSplitUnrecoverableError as e:
+            print(f"  {pr.instance_id}: skip — {e}", file=sys.stderr)
+            return _builder_skip_row(
+                pr,
+                meta,
+                patch=patch,
+                test_patch=test_patch,
+                problem=problem,
+                hints=hints,
+                version=version,
+                task_language=task_language,
+                install_cfg=install_cfg,
+            )
         task_language = resolve_task_language(
             language, repo=repo, patch=patch, test_patch=test_patch, repo_id=pr.repo_id
         )
+        from .patch_paths import collect_gradable_test_paths_from_patch
+
+        gradable_paths = collect_gradable_test_paths_from_patch(
+            test_patch, task_language
+        )
+        if not gradable_paths:
+            print(
+                f"  {pr.instance_id}: skip — no gradable test paths in test_patch "
+                f"(language={task_language})",
+                file=sys.stderr,
+            )
+            return _builder_skip_row(
+                pr,
+                meta,
+                patch=patch,
+                test_patch=test_patch,
+                problem=problem,
+                hints=hints,
+                version=version,
+                task_language=task_language,
+                install_cfg=install_cfg,
+            )
+        from .patch_paths import has_runnable_python_tests
+
+        if task_language == "python" and not has_runnable_python_tests(
+            test_patch, task_language
+        ):
+            print(
+                f"  {pr.instance_id}: skip — no runnable pytest modules in test_patch "
+                f"(docs-only or non-test paths)",
+                file=sys.stderr,
+            )
+            return _builder_skip_row(
+                pr,
+                meta,
+                patch=patch,
+                test_patch=test_patch,
+                problem=problem,
+                hints=hints,
+                version=version,
+                task_language=task_language,
+                install_cfg=install_cfg,
+            )
         from .languages import collect_test_targets
 
         if task_language == "c":
@@ -195,6 +297,7 @@ def build_row(
         "patch": patch,
         "repo": pr.repo_id,
         "base_commit": meta.base_commit,
+        "head_commit": meta.head_commit,
         "hints_text": hints,
         "created_at": meta.created_at,
         "test_patch": test_patch,

@@ -2,6 +2,14 @@ from __future__ import annotations
 
 TASK_TYPE_VALID = "valid"
 TASK_TYPE_PARTIALLY_VALID = "partially_valid"
+TASK_TYPE_SKIP = "skip"
+
+_GRADABLE_TASK_TYPES = frozenset({TASK_TYPE_VALID, TASK_TYPE_PARTIALLY_VALID})
+
+
+def is_gradable_task_type(task_type: str) -> bool:
+    """True when a discover row should be written to JSONL output."""
+    return str(task_type or "").strip() in _GRADABLE_TASK_TYPES
 
 
 def classify_task_type(

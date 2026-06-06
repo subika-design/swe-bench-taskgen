@@ -37,6 +37,11 @@ _CMAKE_NATIVE_INSTALL = (
     'mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && '
     'cmake --build . -j"$(nproc)"'
 )
+_CMAKE_NATIVE_INSTALL_CLEAN = (
+    'rm -rf build && mkdir -p build && cd build && '
+    'cmake .. -DCMAKE_BUILD_TYPE=Release && '
+    'cmake --build . -j"$(nproc)"'
+)
 # Native integration HTTP/3 / QUIC cmake deps (any CMake + nested pytest repo, not curl-only).
 # SWE-bench env images use Debian bookworm: OpenSSL ngtcp2 crypto is not in default apt;
 # use :func:`_ngtcp2_crypto_apt_install_shell` (ossl then gnutls, never unsigned backports).
@@ -68,6 +73,7 @@ _NATIVE_HTTP3_CMAKE_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 _NATIVE_INTEGRATION_FLAG = "native_integration_build"
+_NATIVE_INTEGRATION_HTTP3_DISABLED = "native_integration_http3_disabled"
 _NATIVE_INTEGRATION_ROOT = "native_integration_pytest_root"
 _NATIVE_INTEGRATION_REPO_DIR = "native_integration_repo_dir"
 # SWE-bench harness mounts the repo at /testbed (discover + eval images).
@@ -81,6 +87,15 @@ _CMAKE_PYTEST_TARGET_RE = re.compile(
     re.IGNORECASE,
 )
 _CMAKE_TARGET_RE = re.compile(r"add_custom_target\s*\(\s*([A-Za-z0-9_-]+)\s*", re.IGNORECASE)
+_CMAKE_EXECUTABLE_RE = re.compile(r"add_executable\s*\(\s*([A-Za-z0-9_-]+)\b", re.IGNORECASE)
+_CMAKE_SERVER_BUNDLE_RE = re.compile(r"^BUNDLE\s*=\s*(\S+)", re.MULTILINE)
+_RUNTESTS_HARNESS_SUBDIRS = ("server", "libtest", "unit", "tunit")
+_RUNTESTS_HARNESS_DEFAULT_TOOL = {
+    "server": "servers",
+    "libtest": "libtests",
+    "unit": "units",
+    "tunit": "tunits",
+}
 _CMAKE_BUILD_TARGET_RE = re.compile(
     r"cmake\s+--build\s+\S+\s+--(?:target|-t)\s+([A-Za-z0-9_.-]+)",
     re.IGNORECASE,
@@ -208,10 +223,10 @@ def integration_profile_for_repo(
         return None
 
     if test_paths:
-        py_paths = [
-            p for p in test_paths if PurePosixPath(p.replace("\\", "/")).suffix == ".py"
-        ]
-        root = pytest_root_for_test_paths(py_paths or test_paths)
+        py_paths = filter_integration_pytest_modules(test_paths)
+        if not py_paths:
+            return None
+        root = pytest_root_for_test_paths(py_paths)
         if root and (repo / root.replace("\\", "/")).is_dir():
             return IntegrationPytestProfile(pytest_root=root.replace("\\", "/"))
         return None
@@ -261,6 +276,15 @@ def native_integration_already_applied(cfg: dict[str, Any]) -> bool:
     return bool(cfg.get(_NATIVE_INTEGRATION_FLAG))
 
 
+def native_integration_http3_disabled(cfg: dict[str, Any]) -> bool:
+    return bool(cfg.get(_NATIVE_INTEGRATION_HTTP3_DISABLED))
+
+
+def harness_supports_http3_cmake() -> bool:
+    """SWE-bench env images (Ubuntu jammy) lack ngtcp2 quictls — never enable HTTP/3 there."""
+    return False
+
+
 def native_integration_discover_active(cfg: dict[str, Any] | None) -> bool:
     """True when Docker discover should run CMake + nested pytest (not plain ctest)."""
     return bool(cfg and cfg.get(_NATIVE_INTEGRATION_FLAG))
@@ -273,18 +297,49 @@ def discover_harness_language(task_language: str, install_config: dict[str, Any]
     return task_language
 
 
+def is_integration_pytest_module(path: str) -> bool:
+    """True when *path* is a pytest-collectible module (``test_*.py``), not libtest/C assets."""
+    p = path.replace("\\", "/").strip()
+    if not p.lower().endswith(".py"):
+        return False
+    base = PurePosixPath(p).name.lower()
+    return base.startswith("test_")
+
+
+def filter_integration_pytest_modules(paths: Iterable[str]) -> list[str]:
+    """Keep only runnable nested-pytest modules for native integration discover."""
+    from .languages import filter_python_pytest_targets
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in filter_python_pytest_targets(paths):
+        norm = raw.replace("\\", "/").strip()
+        if not norm or norm in seen or not is_integration_pytest_module(norm):
+            continue
+        seen.add(norm)
+        out.append(norm)
+    return sorted(out)
+
+
+def patch_diff_touches_libtest(test_patch: str) -> bool:
+    """True when *test_patch* changes curl libtest / runtests data (needs ``testdeps``)."""
+    for m in re.finditer(r"^diff --git a/(\S+)", test_patch or "", re.MULTILINE):
+        p = m.group(1).replace("\\", "/").lower()
+        if p.startswith("tests/libtest/") or "/libtest/" in p:
+            return True
+        if p.startswith("tests/data/") and not p.endswith(".py"):
+            return True
+    return False
+
+
 def integration_pytest_paths_from_patches(patch: str, test_patch: str) -> list[str]:
     """Pytest file paths from PR diffs (for CMake+pytest integration repos)."""
-    from .diff_split import collect_heuristic_test_paths_from_patch
-    from .languages import collect_test_targets, filter_python_pytest_targets
+    from .languages import collect_test_targets
 
     paths = collect_test_targets("python", patch, test_patch)
-    if not paths:
-        combined = "\n".join(p for p in (patch, test_patch) if p.strip())
-        paths = collect_heuristic_test_paths_from_patch(combined)
     if not paths and test_patch.strip():
-        paths = collect_heuristic_test_paths_from_patch(test_patch)
-    return filter_python_pytest_targets(paths)
+        paths = collect_test_targets("python", "", test_patch)
+    return filter_integration_pytest_modules(paths)
 
 
 def merge_hybrid_c_integration_paths(
@@ -312,7 +367,8 @@ def merge_hybrid_c_integration_paths(
     for p in int_paths:
         if p not in detection:
             detection.append(p)
-    runner = list(int_paths) if int_paths else list(c_paths)
+    # Runner paths must be pytest modules; never pass libtest/C runtests assets to pytest.
+    runner = list(int_paths)
     return detection, runner
 
 
@@ -325,9 +381,9 @@ def resolve_integration_task_language(
     """When CMake + nested pytest matches PR paths, task language should be ``c``."""
     detection, runner = merge_hybrid_c_integration_paths(patch, test_patch)
     check_paths = runner or detection or None
-    if not repo_has_cmake_integration(repo, test_paths=check_paths):
+    if not runner:
         return None
-    if not runner and not (repo / "tests" / "http" / "conftest.py").is_file():
+    if not repo_has_cmake_integration(repo, test_paths=runner):
         return None
     return "c"
 
@@ -394,11 +450,11 @@ def repo_wants_http3_pytest_cmake(
     """
     Enable HTTP/3 QUIC cmake flags + ngtcp2 apt when the PR or tree targets HTTP/3 pytest.
 
-    Works for any native-integration repo (curl ``tests/http``, etc.), not only
-    ``test_60_h3_proxy.py``.
+    When *test_paths* is provided (including an empty list), only those paths decide
+    HTTP/3 — CI/cmake heuristics are not used. Pass ``None`` when PR paths are unknown.
     """
-    if _test_paths_suggest_http3_pytest(test_paths or []):
-        return True
+    if test_paths is not None:
+        return _test_paths_suggest_http3_pytest(test_paths)
     if _repo_cmake_mentions_http3_quic(repo):
         return True
     if cmake_definitions_from_ci_for_http3_pytest(repo):
@@ -409,10 +465,121 @@ def repo_wants_http3_pytest_cmake(
     return False
 
 
-def native_cmake_install_command(repo: Path, *, http3: bool) -> str:
+def _merge_core_native_apt(
+    existing: Iterable[str],
+    repo: Path,
+) -> list[str]:
+    """Keep core cmake apt (e.g. libnghttp2-dev) without HTTP/3 ngtcp2 packages."""
+    from .c_build import cmake_apt_packages_for_repo
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for raw in list(existing) + list(cmake_apt_packages_for_repo(repo)):
+        pkg = str(raw or "").strip()
+        if not pkg:
+            continue
+        low = pkg.lower()
+        if "ngtcp2" in low or "nghttp3" in low:
+            continue
+        if pkg in seen:
+            continue
+        seen.add(pkg)
+        merged.append(pkg)
+    return filter_native_integration_apt_packages(merged)
+
+
+def _install_looks_like_native_integration(cfg: dict[str, Any]) -> bool:
+    install = str(cfg.get("install") or "").lower()
+    return (
+        native_integration_already_applied(cfg)
+        or native_integration_discover_active(cfg)
+        or "cmake" in install
+        and ("pytest" in str(cfg.get("test_cmd") or "").lower() or "build/" in install)
+    )
+
+
+def remediate_native_integration_ngtcp2(
+    cfg: dict[str, Any],
+    repo: Path,
+    *,
+    test_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Minimal native-integration profile when quictls / HTTP/3 backend is unavailable."""
+    del test_paths
+    out = dict(cfg)
+    out[_NATIVE_INTEGRATION_HTTP3_DISABLED] = True
+    out["install"] = native_cmake_install_command(repo, http3=False, clean_build=True)
+
+    out["apt-pkgs"] = _merge_core_native_apt(list(out.get("apt-pkgs") or []), repo)
+
+    opt = [
+        p
+        for p in list(out.get("apt-pkgs-optional") or [])
+        if "ngtcp2" not in str(p).lower() and "nghttp3" not in str(p).lower()
+    ]
+    if opt:
+        out["apt-pkgs-optional"] = opt
+    elif "apt-pkgs-optional" in out:
+        out["apt-pkgs-optional"] = []
+
+    pre: list[str] = []
+    for ln in list(out.get("pre_install") or []):
+        low = str(ln).lower()
+        if "ngtcp2" in low or "nghttp3" in low or "h2o" in low:
+            continue
+        pre.append(ln)
+    out["pre_install"] = pre
+    return sanitize_native_integration_apt_config(out)
+
+
+def remediate_quictls_native_integration(
+    cfg: dict[str, Any],
+    repo: Path,
+    *,
+    test_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Apply minimal cmake profile when log shows quictls missing or HTTP/3 was configured."""
+    if native_integration_http3_disabled(cfg):
+        return cfg
+    install = str(cfg.get("install") or "")
+    needs = (
+        "USE_NGTCP2" in install.upper()
+        or "USE_PROXY_HTTP3" in install.upper()
+        or _install_looks_like_native_integration(cfg)
+    )
+    if not needs:
+        stripped = strip_http3_cmake_flags(install)
+        if stripped != install:
+            out = dict(cfg)
+            out["install"] = stripped
+            out[_NATIVE_INTEGRATION_HTTP3_DISABLED] = True
+            return out
+        return cfg
+    return remediate_native_integration_ngtcp2(
+        cfg, repo, test_paths=test_paths
+    )
+
+
+def strip_http3_cmake_flags(install: str) -> str:
+    """Remove HTTP/3 QUIC ``-D`` flags when ngtcp2 crypto backend is unavailable."""
+    out: list[str] = []
+    for token in str(install or "").split():
+        up = token.upper()
+        if "USE_NGTCP2" in up or "USE_PROXY_HTTP3" in up:
+            continue
+        out.append(token)
+    return " ".join(out).strip()
+
+
+def native_cmake_install_command(
+    repo: Path,
+    *,
+    http3: bool,
+    clean_build: bool = False,
+) -> str:
     """CMake configure + build under ``build/`` (optionally with CI HTTP/3 ``-D`` flags)."""
     if not http3:
-        return _CMAKE_NATIVE_INSTALL
+        return _CMAKE_NATIVE_INSTALL_CLEAN if clean_build else _CMAKE_NATIVE_INSTALL
     flags = cmake_definitions_from_ci_for_http3_pytest(repo)
     if not flags:
         flags = list(DEFAULT_NATIVE_HTTP3_CMAKE_DEFINITIONS)
@@ -589,10 +756,87 @@ def cmake_pytest_ci_target(repo: Path) -> str | None:
     return targets[0] if targets else None
 
 
-def cmake_native_prepare_targets(repo: Path) -> list[str]:
-    """Build targets that must exist before integration pytest (e.g. ``testdeps``)."""
+def cmake_runtests_harness_subdirs(repo: Path) -> list[str]:
+    """``tests/<subdir>/`` harness trees that ``runtests.pl`` resolves relative to ``tests/``."""
+    if not (repo / "tests" / "runtests.pl").is_file():
+        return []
+    out: list[str] = []
+    for sub in _RUNTESTS_HARNESS_SUBDIRS:
+        d = repo / "tests" / sub
+        if d.is_dir() or (d / "CMakeLists.txt").is_file():
+            out.append(sub)
+    return out
+
+
+def cmake_runtests_harness_tool_name(subdir: str) -> str | None:
+    """Default primary executable name under ``tests/<subdir>/`` (e.g. ``libtests``)."""
+    return _RUNTESTS_HARNESS_DEFAULT_TOOL.get(subdir)
+
+
+def _cmake_harness_subdir_targets(repo: Path, subdir: str) -> set[str]:
+    """
+    CMake target names for a ``tests/<subdir>`` harness (e.g. ``libtests``, ``servers``).
+
+    curl bundles use ``add_executable(${BUNDLE} ...)`` with ``BUNDLE = name`` in Makefile.inc.
+    """
+    targets: set[str] = set()
+    sub_cmake = repo / "tests" / subdir / "CMakeLists.txt"
+    if not sub_cmake.is_file():
+        return targets
+    try:
+        text = sub_cmake.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return targets
+    targets.update(m.group(1) for m in _CMAKE_TARGET_RE.finditer(text))
+    targets.update(m.group(1) for m in _CMAKE_EXECUTABLE_RE.finditer(text))
+    makefile_inc = repo / "tests" / subdir / "Makefile.inc"
+    if makefile_inc.is_file():
+        try:
+            inc = makefile_inc.read_text(encoding="utf-8", errors="replace")
+            bundle = _CMAKE_SERVER_BUNDLE_RE.search(inc)
+            if bundle:
+                targets.add(bundle.group(1))
+        except OSError:
+            pass
+    return targets
+
+
+def _cmake_harness_server_targets(repo: Path) -> set[str]:
+    """Backward-compatible alias for ``tests/server`` bundle targets."""
+    return _cmake_harness_subdir_targets(repo, "server")
+
+
+def cmake_native_prepare_targets(
+    repo: Path,
+    *,
+    include_libtest_targets: bool = True,
+    include_harness_servers: bool = False,
+    include_harness_binaries: bool | None = None,
+) -> list[str]:
+    """
+    Build targets that must exist before integration pytest.
+
+    ``testdeps`` / ``libtests`` compile bundled libtests and fail at base+test_patch
+    when the PR adds libtest stubs that need impl-only API symbols. Skip them for
+    HTTP pytest-only PRs; keep ``build-certs`` for integration server fixtures.
+
+    When *include_harness_binaries* is set (``runtests.pl`` discover), also build
+    harness targets under ``tests/server``, ``tests/libtest``, etc.
+    """
+    harness_binaries = (
+        include_harness_binaries
+        if include_harness_binaries is not None
+        else include_harness_servers
+    )
     present: set[str] = set()
-    for cmake in (repo / "tests" / "CMakeLists.txt", repo / "tests" / "certs" / "CMakeLists.txt"):
+    cmake_files = (
+        repo / "tests" / "CMakeLists.txt",
+        repo / "tests" / "certs" / "CMakeLists.txt",
+    )
+    if harness_binaries:
+        for sub in cmake_runtests_harness_subdirs(repo):
+            cmake_files = cmake_files + (repo / "tests" / sub / "CMakeLists.txt",)
+    for cmake in cmake_files:
         if not cmake.is_file():
             continue
         try:
@@ -600,7 +844,20 @@ def cmake_native_prepare_targets(repo: Path) -> list[str]:
         except OSError:
             continue
         present.update(m.group(1) for m in _CMAKE_TARGET_RE.finditer(text))
-    order = ("testdeps", "libtests", "build-certs", "tt")
+    if harness_binaries:
+        for sub in cmake_runtests_harness_subdirs(repo):
+            present.update(_cmake_harness_subdir_targets(repo, sub))
+    if include_libtest_targets:
+        order: tuple[str, ...] = ("testdeps", "libtests", "build-certs")
+        if harness_binaries:
+            order = order + ("servers",)
+        order = order + ("tt",)
+        if harness_binaries:
+            for extra in ("units", "tunits"):
+                if extra in present:
+                    order = order + (extra,)
+    else:
+        order = ("build-certs",)
     return [t for t in order if t in present]
 
 
@@ -772,10 +1029,59 @@ def native_integration_cmake_src_symlink_lines(repo: Path) -> list[str]:
     ]
 
 
-def native_integration_setup_lines(repo: Path, pytest_root: str) -> list[str]:
-    """Shell lines to run after install / after ``git reset`` before integration pytest."""
+def _cmake_runtests_layout_symlink_line(subdir: str) -> str:
+    """Symlink ``build/tests/<subdir>/*`` into ``tests/<subdir>/`` for ``runtests.pl``."""
+    return (
+        f"mkdir -p tests/{subdir} && "
+        f'for f in build/tests/{subdir}/*; do '
+        f'[[ -e "$f" ]] || continue; '
+        f'bn=$(basename "$f"); '
+        f'ln -sfn "../../build/tests/{subdir}/$bn" "tests/{subdir}/$bn"; '
+        "done"
+    )
+
+
+def cmake_runtests_layout_symlink_lines(repo: Path) -> list[str]:
+    """
+    Bridge CMake harness outputs into autotools paths ``runtests.pl`` expects.
+
+    For each ``tests/<subdir>/`` (server, libtest, unit, tunit), link
+    ``build/tests/<subdir>/*`` → ``tests/<subdir>/*``.
+    """
+    if not (repo / "tests" / "runtests.pl").is_file():
+        return []
+    if not (repo / "CMakeLists.txt").is_file():
+        return []
     lines: list[str] = []
-    for prep in cmake_native_prepare_targets(repo):
+    for sub in cmake_runtests_harness_subdirs(repo):
+        ln = _cmake_runtests_layout_symlink_line(sub)
+        if ln not in lines:
+            lines.append(ln)
+    return lines
+
+
+def cmake_runtests_server_symlink_lines(repo: Path) -> list[str]:
+    """Deprecated: use :func:`cmake_runtests_layout_symlink_lines`."""
+    return cmake_runtests_layout_symlink_lines(repo)
+
+
+def native_integration_setup_lines(
+    repo: Path,
+    pytest_root: str,
+    *,
+    test_patch: str = "",
+    pytest_paths: list[str] | None = None,
+) -> list[str]:
+    """Shell lines to run after install / after ``git reset`` before integration pytest."""
+    del pytest_paths  # reserved: future patch-aware server target selection
+    if test_patch.strip():
+        include_libtest = patch_diff_touches_libtest(test_patch)
+    else:
+        include_libtest = True
+    lines: list[str] = []
+    for prep in cmake_native_prepare_targets(
+        repo, include_libtest_targets=include_libtest
+    ):
         cmd = f'cmake --build build --target {prep} -j"$(nproc)"'
         if cmd not in lines:
             lines.append(cmd)
@@ -959,7 +1265,6 @@ def native_build_install_config(
     Sets ``native_integration_build`` so Docker discover can treat empty JUnit as
     test discovery failure rather than repeating apt-only remediation.
     """
-    del test_patch  # reserved for future patch-aware pip hints
     profile = integration_profile_for_repo(repo, test_paths=test_paths)
     if profile is None:
         return cfg
@@ -974,7 +1279,10 @@ def native_build_install_config(
     out[_NATIVE_INTEGRATION_ROOT] = profile.pytest_root
     out[_NATIVE_INTEGRATION_REPO_DIR] = _DEFAULT_HARNESS_REPO_DIR
 
-    http3 = repo_wants_http3_pytest_cmake(repo, test_paths)
+    if native_integration_http3_disabled(out) or not harness_supports_http3_cmake():
+        http3 = False
+    else:
+        http3 = repo_wants_http3_pytest_cmake(repo, test_paths)
 
     out = ensure_c_install_config(out, repo=repo)
     out["install"] = native_cmake_install_command(repo, http3=http3)
@@ -1024,7 +1332,12 @@ def native_build_install_config(
     if build_path not in post:
         post.append(build_path)
     out["post_install"] = post
-    setup = native_integration_setup_lines(repo, profile.pytest_root)
+    setup = native_integration_setup_lines(
+        repo,
+        profile.pytest_root,
+        test_patch=test_patch,
+        pytest_paths=test_paths,
+    )
     out = _merge_setup_into_config_lists(out, setup)
     out["eval_commands"] = native_integration_eval_commands(out)
 
@@ -1059,6 +1372,8 @@ def apply_native_build_if_integration(
     """Apply :func:`native_build_install_config` when the repo matches the pattern."""
     if repo is None:
         return cfg
+    if native_integration_http3_disabled(cfg):
+        return cfg
     if native_integration_already_applied(cfg):
         return cfg
     lang = str(cfg.get("language") or "").strip().lower()
@@ -1067,10 +1382,11 @@ def apply_native_build_if_integration(
     detection, runner = merge_hybrid_c_integration_paths(
         patch, test_patch, test_paths=test_paths
     )
-    check_paths = runner or detection or None
-    if not repo_has_cmake_integration(repo, test_paths=check_paths):
+    if not runner:
         return cfg
-    profile_paths = runner or detection or test_paths
+    if not repo_has_cmake_integration(repo, test_paths=runner):
+        return cfg
+    profile_paths = runner
     cfg = native_build_install_config(
         cfg,
         repo,

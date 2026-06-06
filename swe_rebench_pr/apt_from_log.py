@@ -157,6 +157,10 @@ def merge_integration_apt_into_config(
 
 
 def _native_integration_http3_install(cfg: dict[str, Any]) -> bool:
+    from .integration_build import native_integration_http3_disabled
+
+    if native_integration_http3_disabled(cfg):
+        return False
     install = str(cfg.get("install") or "")
     return "USE_NGTCP2" in install.upper() or "USE_PROXY_HTTP3" in install.upper()
 
@@ -168,6 +172,7 @@ def sanitize_native_integration_apt_config(cfg: dict[str, Any]) -> dict[str, Any
     from .integration_build import (
         filter_native_integration_apt_packages,
         native_integration_eval_commands,
+        native_integration_http3_disabled,
         strip_unsafe_native_shell_lines,
     )
 
@@ -175,6 +180,12 @@ def sanitize_native_integration_apt_config(cfg: dict[str, Any]) -> dict[str, Any
     out = dict(cfg)
     def _sanitize_pkgs(pkgs: list[str]) -> list[str]:
         cleaned = sanitize_apt_package_names(pkgs)
+        if native_integration_http3_disabled(cfg):
+            cleaned = [
+                p
+                for p in cleaned
+                if "ngtcp2" not in str(p).lower() and "nghttp3" not in str(p).lower()
+            ]
         if http3:
             for name in ("h2o",):
                 if name in {p.lower() for p in pkgs} and name not in {p.lower() for p in cleaned}:

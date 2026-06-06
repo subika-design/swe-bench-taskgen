@@ -10,6 +10,9 @@ from typing import Any
 
 _CACHE_ENV = "SWE_REBENCH_INSTALL_CACHE"
 
+# Bump when repo-first heuristics change so stale cached configs are not reused.
+INSTALL_CONFIG_CACHE_VERSION = "3"
+
 _FINGERPRINT_FILES = (
     ".github/workflows",
     "go.mod",
@@ -29,6 +32,7 @@ _FINGERPRINT_FILES = (
     "pyproject.toml",
     "setup.py",
     "requirements.txt",
+    "tox.ini",
     "Dockerfile",
     ".travis.yml",
 )
@@ -51,7 +55,7 @@ def _file_digest(path: Path) -> str:
 
 def install_config_cache_key(repo_id: str, repo: Path) -> str:
     """Stable key from repo slug + hashed install-relevant files."""
-    parts: list[str] = [repo_id.replace("/", "__")]
+    parts: list[str] = [f"v:{INSTALL_CONFIG_CACHE_VERSION}", repo_id.replace("/", "__")]
     wf = repo / ".github" / "workflows"
     if wf.is_dir():
         try:

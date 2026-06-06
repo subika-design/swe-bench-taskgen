@@ -53,6 +53,9 @@ def test_ruby_body_passes_targets_to_rspec():
     assert "reset to base_commit" in body
     assert "_ruby_ensure_junit_formatter" in body
     assert "empty_junit_if_missing.py" in body
+    assert "SKIP_REPO_JUNIT_HARVEST=1" in body
+    assert "if [[ ${#T[@]} -gt 0 ]]; then" in body
+    assert "2>/dev/null || bundle exec rspec" not in body
 
 
 def test_ruby_body_minitest_runner():

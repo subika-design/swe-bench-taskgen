@@ -110,15 +110,32 @@ def infer_gradle_module_from_test_path(path: str) -> str | None:
     ``spring-boot-project/spring-boot-docs/src/test/java/Foo.java``
     -> ``spring-boot-project:spring-boot-docs``
     """
-    p = path.replace("\\", "/").strip()
-    if "/src/test/" not in p:
+    prefix = module_prefix_before_java_test(path)
+    if prefix is None:
         return None
-    prefix = p.split("/src/test/", 1)[0]
+    if prefix == "":
+        return ""
     parts = [x for x in prefix.split("/") if x]
     if len(parts) >= 2:
         return f"{parts[0]}:{parts[1]}"
     if len(parts) == 1:
         return parts[0]
+    return ""
+
+
+def module_prefix_before_java_test(path: str) -> str | None:
+    """
+    Directory prefix before ``src/test/``; ``""`` for repo-root ``src/test/`` layout.
+
+    Returns ``None`` when the path is not a Java test path.
+    """
+    p = path.replace("\\", "/").strip().lstrip("/")
+    if p.startswith("src/test/") or p.startswith("src/intTest/"):
+        return ""
+    if "/src/test/" in p:
+        return p.split("/src/test/", 1)[0].strip("/")
+    if "/src/intTest/" in p:
+        return p.split("/src/intTest/", 1)[0].strip("/")
     return None
 
 
@@ -362,12 +379,56 @@ def _gradle_wrapper_flags() -> str:
     )
 
 
-def _gradle_compile_tasks(modules: list[str]) -> str:
+def _gradle_compile_tasks(modules: list[str], *, repo: Path | None = None) -> str:
+    from .java_gradle_llm import (
+        discover_gradle_projects_from_settings,
+        gradle_task_for_project,
+    )
+
     flags = _gradle_wrapper_flags()
     if not modules:
         return f"./gradlew {flags} classes -x check || true"
-    tasks = " ".join(f":{m}:compileTestJava" for m in modules)
+    index = discover_gradle_projects_from_settings(repo) if repo is not None else None
+    task_names: list[str] = []
+    for m in modules:
+        proj = f":{m}" if m else ":"
+        if index is not None and repo is not None:
+            task_names.append(
+                gradle_task_for_project(proj, "compileTestJava", index, repo)
+            )
+        else:
+            task_names.append(f":{m}:compileTestJava" if m else ":compileTestJava")
+    tasks = " ".join(task_names)
     return f"./gradlew {flags} {tasks} -x check || true"
+
+
+def gradle_default_build_install_command() -> str:
+    """Docker-replayable compile install (CI ``./gradlew build`` style, tests skipped)."""
+    from .ci_install_normalize import _normalize_gradlew_build_command
+
+    return _normalize_gradlew_build_command("./gradlew clean build --no-daemon")
+
+
+def install_cmd_is_gradle_chmod_only(install: str) -> bool:
+    """True when ``install`` only chmods the wrapper without compiling."""
+    s = (install or "").strip()
+    if not s or install_cmd_is_noop(s):
+        return True
+    if "./gradlew" not in s and "gradlew" not in s:
+        return False
+    low = s.lower()
+    return not any(tok in low for tok in ("build", "classes", "assemble", "compile", ":compile"))
+
+
+def gradle_harness_install_and_post(
+    modules: list[str],
+    *,
+    repo: Path | None = None,
+) -> tuple[str, list[str]]:
+    """Default Gradle ``install`` + ``post_install`` for harness discover."""
+    install = gradle_default_build_install_command()
+    post = [_gradle_compile_tasks(modules, repo=repo)] if modules else []
+    return install, post
 
 
 def format_java_harness_context_for_llm(
@@ -431,23 +492,62 @@ def _gradle_test_filter_for_fqcn(fqcn: str) -> str:
     return f"--tests '{fqcn}'"
 
 
-def gradle_junit_report_roots(test_paths: list[str]) -> list[str]:
+def gradle_junit_report_roots(
+    test_paths: list[str],
+    *,
+    gradle_path_by_test_path: dict[str, str] | None = None,
+    repo: Path | None = None,
+) -> list[str]:
     """Module-relative ``build/test-results`` dirs to merge (avoids buildSrc noise)."""
+    from .java_gradle_llm import (
+        _root_gradle_project,
+        discover_gradle_projects_from_settings,
+    )
+
+    mapping = gradle_path_by_test_path or {}
+    index = discover_gradle_projects_from_settings(repo) if repo is not None else None
     roots: set[str] = set()
     for p in test_paths:
-        norm = p.replace("\\", "/").strip()
-        if "/src/test/" in norm:
-            roots.add(norm.split("/src/test/", 1)[0] + "/build/test-results")
+        norm = p.replace("\\", "/")
+        gp = mapping.get(norm)
+        if gp and index is not None and repo is not None:
+            root = _root_gradle_project(index, repo)
+            if gp == root:
+                roots.add("build/test-results")
+            else:
+                rel = gp.lstrip(":").replace(":", "/")
+                roots.add(f"{rel}/build/test-results")
+            continue
+        prefix = module_prefix_before_java_test(p)
+        if prefix is None:
+            continue
+        if prefix:
+            roots.add(prefix + "/build/test-results")
+        else:
+            roots.add("build/test-results")
     return sorted(roots)
 
 
 def java_fqcn_from_test_path(path: str) -> str | None:
     """``src/test/java/pkg/Foo.java`` -> ``pkg.Foo``."""
-    p = path.replace("\\", "/").strip()
-    for marker in ("/src/test/java/", "/src/intTest/java/"):
+    p = path.replace("\\", "/").strip().lstrip("/")
+    for marker in ("src/test/java/", "src/intTest/java/"):
         if marker in p and p.endswith(".java"):
             return p.split(marker, 1)[1][:-5].replace("/", ".")
     return None
+
+
+def java_fqcn_from_test_path_on_disk(repo: Path, test_path: str) -> str | None:
+    """FQCN from on-disk source (``package`` decl) when the file exists."""
+    from .java_gradle_llm import _find_test_file_on_disk, java_fqcn_from_source_file
+
+    disk = _find_test_file_on_disk(repo, test_path)
+    if disk is not None:
+        fqcn = java_fqcn_from_source_file(disk)
+        if fqcn:
+            return fqcn
+        return java_fqcn_from_test_path(disk.relative_to(repo).as_posix())
+    return java_fqcn_from_test_path(test_path)
 
 
 def _gradle_test_cmd_prefix() -> str:
@@ -460,33 +560,59 @@ def _gradle_test_tasks(
     test_paths: list[str] | None = None,
     *,
     gradle_path_by_test_path: dict[str, str] | None = None,
+    repo: Path | None = None,
 ) -> str:
+    from .java_gradle_llm import (
+        discover_gradle_projects_from_settings,
+        gradle_test_task_for_project,
+    )
+
     paths = list(test_paths or [])
     mapping = gradle_path_by_test_path or {}
-    by_mod: dict[str, list[str]] = {}
+    index = discover_gradle_projects_from_settings(repo) if repo is not None else None
+    by_proj: dict[str, list[str]] = {}
     for tp in paths:
         norm = tp.replace("\\", "/")
         gp = mapping.get(norm)
-        mod = gp.lstrip(":") if gp else infer_gradle_module_from_test_path(tp)
-        fqcn = java_fqcn_from_test_path(tp)
-        if mod and fqcn:
-            by_mod.setdefault(mod, []).append(fqcn)
+        if gp:
+            proj = gp if gp.startswith(":") else f":{gp}"
+        else:
+            mod = infer_gradle_module_from_test_path(tp)
+            proj = f":{mod}" if mod else ":"
+        fqcn = (
+            java_fqcn_from_test_path_on_disk(repo, tp)
+            if repo is not None
+            else java_fqcn_from_test_path(tp)
+        )
+        if fqcn is not None:
+            by_proj.setdefault(proj, []).append(fqcn)
     flags = _gradle_wrapper_flags()
     gradle_props = "-Dorg.gradle.parallel=false --continue"
-    if by_mod:
+    if by_proj:
         chunks: list[str] = []
-        for mod in sorted(by_mod):
-            fqcns = sorted(set(by_mod[mod]))
+        for proj in sorted(by_proj, key=lambda p: p or ""):
+            fqcns = sorted(set(by_proj[proj]))
             filters = " ".join(
                 _gradle_test_filter_for_fqcn(fqcn) for fqcn in fqcns
             )
-            chunks.append(f":{mod}:test {filters}")
+            if index is not None and repo is not None:
+                task = gradle_test_task_for_project(proj, index, repo)
+            else:
+                tail = proj.lstrip(":")
+                task = f":{tail}:test" if tail else ":test"
+            chunks.append(f"{task} {filters}")
         body = f"./gradlew {flags} {' '.join(chunks)} {gradle_props} || true"
         return _gradle_test_cmd_prefix() + body
     if not modules:
-        body = f"./gradlew {flags} test {gradle_props} || true"
+        body = f"./gradlew {flags} :test {gradle_props} || true"
         return _gradle_test_cmd_prefix() + body
-    tasks = " ".join(f":{m}:test" for m in modules)
+    if index is not None and repo is not None:
+        tasks = " ".join(
+            gradle_test_task_for_project(f":{m}" if m else ":", index, repo)
+            for m in modules
+        )
+    else:
+        tasks = " ".join(f":{m}:test" if m else ":test" for m in modules)
     body = f"./gradlew {flags} {tasks} {gradle_props} || true"
     return _gradle_test_cmd_prefix() + body
 
@@ -519,12 +645,20 @@ def java_install_config_for_repo(
         cfg["java_build_system"] = "gradle"
         cfg["docker_image"] = eclipse_temurin_docker_image(java_major)
         cfg["pre_install"] = pre
-        cfg["install"] = "chmod +x ./gradlew 2>/dev/null || true"
-        cfg["post_install"] = [_gradle_compile_tasks(modules)]
-        cfg["test_cmd"] = _gradle_test_tasks(
-            modules, paths, gradle_path_by_test_path=gradle_path_by_test_path
+        cfg["install"], cfg["post_install"] = gradle_harness_install_and_post(
+            modules, repo=repo
         )
-        cfg["gradle_junit_roots"] = gradle_junit_report_roots(paths)
+        cfg["test_cmd"] = _gradle_test_tasks(
+            modules,
+            paths,
+            gradle_path_by_test_path=gradle_path_by_test_path,
+            repo=repo,
+        )
+        cfg["gradle_junit_roots"] = gradle_junit_report_roots(
+            paths,
+            gradle_path_by_test_path=gradle_path_by_test_path,
+            repo=repo,
+        )
         cfg["docker_specs"] = {"java_version": str(java_major)}
         cfg["pip_packages"] = []
         cfg["reqs_path"] = []
@@ -613,7 +747,18 @@ def merge_java_build_into_config(
     ):
         if key in hinted:
             out[key] = hinted[key]
-    return out
+    inst = str(out.get("install") or "").strip()
+    hinted_inst = str(hinted.get("install") or "").strip()
+    if install_cmd_is_gradle_chmod_only(inst) or install_cmd_is_noop(inst):
+        if hinted_inst and not install_cmd_is_gradle_chmod_only(hinted_inst):
+            out["install"] = hinted["install"]
+        elif not out.get("_ci_install_trusted"):
+            out["install"] = gradle_default_build_install_command()
+        if hinted.get("post_install") and not out.get("post_install"):
+            out["post_install"] = hinted["post_install"]
+        elif modules and not out.get("post_install"):
+            out["post_install"] = [_gradle_compile_tasks(modules, repo=repo)]
+    return repair_gradle_install_config_for_harness(out)
 
 
 _JAVA_HARNESS_PRESERVE_KEYS: tuple[str, ...] = (
@@ -689,11 +834,13 @@ def merge_java_harness_fields_after_llm(before: dict[str, Any], after: dict[str,
             out["docker_specs"] = dict(before["docker_specs"])
     tc_before = str(before.get("test_cmd") or "")
     tc_after = str(out.get("test_cmd") or "")
-    if "./gradlew" in tc_before and ("pytest" in tc_after or not tc_after.strip()):
+    from .harness_guards import is_valid_java_test_cmd, restore_test_cmd_if_invalid
+
+    out = restore_test_cmd_if_invalid(before, out, language="java")
+    tc_after = str(out.get("test_cmd") or "")
+    if "./gradlew" in tc_before and not is_valid_java_test_cmd(tc_after, out):
         out["test_cmd"] = tc_before
-    if tc_before.strip().startswith("mvn ") and (
-        "pytest" in tc_after or not tc_after.strip() or not tc_after.strip().startswith("mvn ")
-    ):
+    if tc_before.strip().startswith("mvn ") and not is_valid_java_test_cmd(tc_after, out):
         out["test_cmd"] = tc_before
     elif _maven_cmd_has_compiler_overrides(tc_before) and not _maven_cmd_has_compiler_overrides(tc_after):
         if tc_after.strip().startswith("mvn "):
@@ -702,6 +849,11 @@ def merge_java_harness_fields_after_llm(before: dict[str, Any], after: dict[str,
     inst_after = str(out.get("install") or "")
     if install_cmd_is_noop(inst_after) and before.get("install"):
         out["install"] = before["install"]
+    elif install_cmd_is_gradle_chmod_only(inst_after):
+        if inst_before.strip() and not install_cmd_is_gradle_chmod_only(inst_before):
+            out["install"] = before["install"]
+        elif str(out.get("java_build_system") or "").lower() == "gradle":
+            out["install"] = gradle_default_build_install_command()
     elif _maven_cmd_has_compiler_overrides(inst_before) and not _maven_cmd_has_compiler_overrides(inst_after):
         if inst_after.strip().startswith("mvn "):
             out["install"] = inst_before
@@ -709,7 +861,16 @@ def merge_java_harness_fields_after_llm(before: dict[str, Any], after: dict[str,
         if isinstance(before.get(key), list) and before[key]:
             if not isinstance(out.get(key), list) or not out.get(key):
                 out[key] = list(before[key])
-    return ensure_java_docker_specs(out, language="java")
+    if (
+        str(out.get("java_build_system") or "").lower() == "gradle"
+        and install_cmd_is_gradle_chmod_only(str(out.get("install") or ""))
+        and isinstance(before.get("post_install"), list)
+        and before["post_install"]
+        and not out.get("post_install")
+    ):
+        out["post_install"] = list(before["post_install"])
+    out = ensure_java_docker_specs(out, language="java")
+    return repair_gradle_install_config_for_harness(out)
 
 
 def repair_gradle_install_config_for_harness(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -751,8 +912,11 @@ def repair_gradle_install_config_for_harness(cfg: dict[str, Any]) -> dict[str, A
             return _gradle_test_cmd_prefix() + body
         return body
 
-    if out.get("test_cmd"):
-        out["test_cmd"] = _fix_cmd(str(out["test_cmd"]))
+    from .harness_guards import is_valid_java_test_cmd
+
+    tc = str(out.get("test_cmd") or "")
+    if tc and is_valid_java_test_cmd(tc, out):
+        out["test_cmd"] = _fix_cmd(tc)
     post = out.get("post_install")
     if isinstance(post, list):
         out["post_install"] = [_fix_cmd(str(x)) for x in post]
@@ -768,6 +932,16 @@ def install_cmd_is_noop(install: str) -> bool:
 
 def log_indicates_gradle_build_ok(log_tail: str) -> bool:
     return "BUILD SUCCESSFUL" in log_tail and "gradle" in log_tail.lower()
+
+
+def log_indicates_gradle_module_slice_mismatch(
+    *,
+    n_base: int,
+    n_patch: int,
+    tp_tot: int,
+) -> bool:
+    """JUnit ran (often wrong module) but zero cases matched ``test_patch`` paths."""
+    return n_base > 0 and n_patch == 0 and tp_tot == 0
 
 
 def log_indicates_maven_missing_project(log_tail: str) -> bool:
@@ -859,6 +1033,45 @@ def install_config_remediation_unchanged(before: dict[str, Any], after: dict[str
         "docker_image",
         "docker_specs",
         "js_test_runner",
+        "php_test_runner",
         "apt-pkgs",
     )
     return all(before.get(k) == after.get(k) for k in keys)
+
+
+_REMEDIATION_SUBSTANTIVE_KEYS = (
+    "install",
+    "test_cmd",
+    "post_install",
+    "pip_packages",
+    "reqs_path",
+    "pytest_plugins",
+    "maven_junit_roots",
+    "gradle_junit_roots",
+    "docker_image",
+    "docker_specs",
+    "js_test_runner",
+)
+
+
+def install_config_substantive_change(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """True when remediation changed more than apt/pre_install-only hygiene."""
+    if install_config_remediation_unchanged(before, after):
+        return False
+    return any(before.get(k) != after.get(k) for k in _REMEDIATION_SUBSTANTIVE_KEYS)
+
+
+def log_indicates_git_clone_failure(log: str, *, docker_exit: int = 0) -> bool:
+    """True when Docker failed before install/tests due to git checkout."""
+    low = (log or "").lower()
+    if docker_exit == 128:
+        return True
+    return any(
+        needle in low
+        for needle in (
+            "could not parse object",
+            "fatal: ambiguous argument",
+            "fatal: reference is not a tree",
+            "remote did not send all necessary objects",
+        )
+    )

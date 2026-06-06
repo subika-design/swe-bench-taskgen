@@ -410,6 +410,25 @@ def sanitize_install_config_for_docker(
 
         if language_supports_native_integration(str(out.get("language") or "")):
             out = apply_native_build_if_integration(out, repo)
+
+    lang = str(out.get("language") or "python").strip().lower()
+    if lang in ("python", "py"):
+        from .ci_install_normalize import docker_safe_python_install, normalize_ci_test_command
+
+        out["install"] = docker_safe_python_install(str(out.get("install") or ""))
+        for key in ("pre_install", "post_install"):
+            lines = out.get(key)
+            if not isinstance(lines, list):
+                continue
+            out[key] = [
+                docker_safe_python_install(ln) if re.search(r"\buv\b", ln, re.IGNORECASE) else ln
+                for ln in lines
+                if isinstance(ln, str) and ln.strip()
+            ]
+        tc = str(out.get("test_cmd") or "").strip()
+        if tc and re.search(r"\buv\s+run\b", tc, re.IGNORECASE):
+            out["test_cmd"] = normalize_ci_test_command(tc, language="python")
+
     return out
 
 
@@ -482,10 +501,15 @@ def llm_fix_recipe_from_docker_tests(
     ci_context: str = "",
 ) -> dict[str, Any]:
     """Update ``install_config`` from pytest JUnit diagnostics (fail / error / import skips)."""
+    from .harness_guards import extract_structured_failure_log
+
+    structured = extract_structured_failure_log(
+        diagnostics_text, language=str(install_config.get("language") or "")
+    )
     tpl = load_prompt("fix_install_from_tests.txt")
     user = (
         tpl.replace("{{install_config}}", json.dumps(install_config, indent=2))
-        .replace("{{cut_logs}}", diagnostics_text[-120_000:])
+        .replace("{{cut_logs}}", structured[-120_000:])
         .replace("{{ci_context}}", (ci_context or "(none)")[:8000])
     )
     raw = chat_completions(
@@ -533,8 +557,13 @@ def llm_fix_recipe(
     timeout_s: int,
 ) -> dict[str, Any]:
     tpl = load_prompt("fix_install_recipe.txt")
+    from .harness_guards import extract_structured_failure_log
+
+    structured = extract_structured_failure_log(
+        cut_logs, language=str(install_config.get("language") or "")
+    )
     user = tpl.replace("{{install_config}}", json.dumps(install_config, indent=2)).replace(
-        "{{cut_logs}}", cut_logs[-12_000:]
+        "{{cut_logs}}", structured[-12_000:]
     )
     raw = chat_completions(
         api_key=api_key,
@@ -695,8 +724,10 @@ def default_install_config_heuristic(repo: Path, language: str = "python") -> di
         has_py = (repo / "pyproject.toml").is_file() or (repo / "setup.py").is_file()
         cfg["install"] = "pip install -e ." if has_py else "pip install ."
         from .integration_build import apply_native_build_if_integration
+        from .python_build import merge_python_test_install_into_config
 
         cfg = apply_native_build_if_integration(cfg, repo)
+        cfg = merge_python_test_install_into_config(cfg, repo)
     elif lang == "java":
         from .java_build import java_install_config_for_repo
 
@@ -730,4 +761,8 @@ def default_install_config_heuristic(repo: Path, language: str = "python") -> di
         from .php_build import php_install_config_for_repo
 
         return normalize_install_config(php_install_config_for_repo(repo, base=cfg))
+    elif lang == "go":
+        from .go_build import go_install_config_for_repo
+
+        return normalize_install_config(go_install_config_for_repo(repo, base=cfg))
     return normalize_install_config(cfg)

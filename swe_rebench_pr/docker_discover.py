@@ -40,6 +40,8 @@ from .java_build import (
     detect_maven_compiler_major,
     install_config_affects_env_image,
     install_config_remediation_unchanged,
+    install_config_substantive_change,
+    log_indicates_git_clone_failure,
     log_indicates_gradle_build_ok,
     log_indicates_maven_missing_project,
     log_indicates_maven_tests_ran,
@@ -60,6 +62,16 @@ def _test_patch_only_targets(language: str, test_patch: str) -> list[str]:
         int_paths = integration_pytest_paths_from_patches("", test_patch)
         if int_paths:
             return int_paths
+        from .runtests_build import collect_runtests_numbers
+        from .integration_build import patch_diff_touches_libtest
+
+        if patch_diff_touches_libtest(test_patch):
+            paths = collect_test_targets_from_test_patch(language, test_patch)
+            if paths:
+                return paths
+            nums = collect_runtests_numbers(test_patch)
+            return [f"tests/data/test{n}" for n in nums]
+        return collect_test_targets_from_test_patch(language, test_patch)
     paths = collect_test_targets_from_test_patch(language, test_patch)
     if paths:
         return paths
@@ -261,11 +273,17 @@ def _docker_log_tail_for_display(stderr: str, stdout: str, *, max_len: int = 400
         "[harvest]",
         "BUILD FAILED",
         "BUILD SUCCESSFUL",
-        "patch apply",
+        "What went wrong:",
+        "Caused by:",
         "FAILURE:",
-        "error:",
+        "patch apply",
         "Corrupt patch",
         "npm ERR!",
+        "composer install",
+        "Your requirements could not be resolved",
+        "Problem 1",
+        "Script ",
+        "error:",
     )
     picked = [ln for ln in lines if any(m in ln for m in markers)]
     if picked:
@@ -292,6 +310,10 @@ def _docker_install_failed(
         and str(install_config.get("java_build_system") or "").lower() == "maven"
     )
     if docker_exit != 0:
+        from .harness_guards import log_indicates_patch_apply_failed
+
+        if log_indicates_patch_apply_failed(log_tail):
+            return False
         if (
             gradle
             and log_indicates_gradle_build_ok(log_tail)
@@ -301,6 +323,24 @@ def _docker_install_failed(
         ):
             return False
         low = log_tail.lower()
+        from .harness_guards import (
+            log_indicates_gradle_build_failed_during_tests,
+            log_indicates_gradle_no_tests_found_for_includes,
+        )
+
+        if (
+            lang == "java"
+            and gradle
+            and log_indicates_gradle_build_failed_during_tests(log_tail)
+            and "[docker] applying patch" in low
+        ):
+            return False
+        if (
+            lang == "java"
+            and gradle
+            and log_indicates_gradle_no_tests_found_for_includes(log_tail)
+        ):
+            return False
         native_integration = (
             install_config is not None and install_config.get("native_integration_build")
         )
@@ -318,6 +358,9 @@ def _docker_install_failed(
     # JavaScript: empty JUnit is usually test_cmd/reporter — not install (unless docker exited).
     if lang == "javascript" and docker_exit == 0:
         return False
+    # PHP: empty JUnit is usually test_cmd/runner — not composer install (unless docker exited).
+    if lang == "php" and docker_exit == 0:
+        return False
     # C harness may compile successfully but emit non-path-matching/empty JUnit.
     # Treat this as discovery mismatch, not install failure, when docker run succeeded.
     if (
@@ -327,6 +370,12 @@ def _docker_install_failed(
         and n_patch == 0
         and not (install_config or {}).get("native_integration_build")
     ):
+        from .runtests_build import cmake_runtests_discover_active
+
+        if cmake_runtests_discover_active(install_config or {}):
+            return False
+        if "ctest" in str((install_config or {}).get("test_cmd") or "").lower():
+            return False
         return False
     if (
         lang == "go"
@@ -341,7 +390,35 @@ def _docker_install_failed(
         and n_targets > 0
         and n_patch == 0
     ):
+        from .ruby_build import log_indicates_ruby_gem_not_found
+
+        if log_indicates_ruby_gem_not_found(log_tail):
+            return True
         return False
+    if lang == "python" and docker_exit == 0 and n_targets > 0 and n_patch == 0:
+        low = log_tail.lower()
+        install_markers = (
+            "no module named",
+            "modulenotfounderror",
+            "metadata-generation-failed",
+            "could not find a version",
+            "pip install",
+            "subprocess-exited-with-error",
+            "error: failed",
+        )
+        if any(m in low for m in install_markers):
+            return True
+        if any(
+            m in low
+            for m in (
+                "pytest",
+                "collecting",
+                "collected 0 items",
+                "junit",
+                "no tests ran",
+            )
+        ):
+            return False
     if (
         lang in ("python", "c")
         and docker_exit == 0
@@ -358,6 +435,23 @@ def _docker_install_failed(
         if maven and log_indicates_maven_tests_ran(log_tail):
             if "patch apply check failed" not in log_tail.lower():
                 return False
+        from .harness_guards import (
+            log_indicates_gradle_build_failed_during_tests,
+            log_indicates_gradle_no_tests_found_for_includes,
+        )
+
+        if (
+            lang == "java"
+            and gradle
+            and log_indicates_gradle_build_failed_during_tests(log_tail)
+        ):
+            return False
+        if (
+            lang == "java"
+            and gradle
+            and log_indicates_gradle_no_tests_found_for_includes(log_tail)
+        ):
+            return False
         return True
     low = log_tail.lower()
     if "pyprojectoptionexception" in low and "qmake" in low:
@@ -448,37 +542,24 @@ def _docker_install_config_effective(
         elif cfg.get("apt-pkgs"):
             cfg["apt-pkgs"] = []
 
-    if repo is not None and (repo / "tox.ini").is_file():
-        tox_pytest = (
-            "pytest",
-            "pytest-cov",
-            "pytest-randomly",
-            "wcag-contrast-ratio",
-        )
-        pkgs = list(cfg.get("pip_packages") or [])
-        pkgs_low = {p.split("==")[0].split("[")[0].strip().lower() for p in pkgs}
-        for name in tox_pytest:
-            if name.lower() not in pkgs_low:
-                pkgs.append(name)
-        cfg["pip_packages"] = pkgs
-
     if lang in ("python", "py", ""):
-        from .python_build import augment_python_install_config
+        from .python_build import finalize_python_install_config
 
-        cfg = augment_python_install_config(cfg, repo=repo, repo_id=pr.repo_id)
-        from .integration_build import apply_native_build_if_integration
+        cfg = finalize_python_install_config(cfg, repo, repo_id=pr.repo_id)
+        from .integration_build import (
+            apply_native_build_if_integration,
+            native_integration_http3_disabled,
+        )
 
-        cfg = apply_native_build_if_integration(cfg, repo)
+        if not native_integration_http3_disabled(cfg):
+            cfg = apply_native_build_if_integration(cfg, repo)
         from .apt_from_log import sanitize_native_integration_apt_config
 
         cfg = sanitize_native_integration_apt_config(cfg)
     elif lang == "c" and repo is not None:
-        from .integration_build import apply_native_build_if_integration
+        from .runtests_build import sanitize_cmake_http3_for_harness
 
-        cfg = apply_native_build_if_integration(cfg, repo)
-        from .apt_from_log import sanitize_native_integration_apt_config
-
-        cfg = sanitize_native_integration_apt_config(cfg)
+        cfg = sanitize_cmake_http3_for_harness(cfg, repo)
         cfg["language"] = "c"
     return cfg
 
@@ -516,10 +597,14 @@ def _effective_result_format(
         return fmt.strip()
     if install_config.get("native_integration_build"):
         return "junit"
+    if install_config.get("cmake_runtests_build"):
+        return "runtests_log"
     from .c_build import is_premake_config
 
     if is_premake_config(install_config):
         return "googletest_log"
+    if "ctest" in str(install_config.get("test_cmd") or "").lower():
+        return "ctest_log"
     return None
 
 
@@ -781,6 +866,8 @@ def _docker_pytest_attempt(
         cmd.extend(["-v", f"{testbed_dir}:/testbed"])
     if base_commit.strip():
         cmd.extend(["-e", f"SWEBENCH_BASE_COMMIT={base_commit.strip()}"])
+    if eff_cfg.get("discovery_patch_full_suite"):
+        cmd.extend(["-e", "DISCOVERY_PATCH_FULL_SUITE=1"])
     for k in ("SWEBENCH_POST_CLONE_SH", "GITHUB_TOKEN", "GH_TOKEN"):
         if env.get(k):
             cmd.extend(["-e", f"{k}={env[k]}"])
@@ -813,8 +900,14 @@ def _docker_pytest_attempt(
             runner = "pytest (native integration)"
         else:
             from .c_build import is_premake_config
+            from .runtests_build import cmake_runtests_discover_active
 
-            runner = "premake5 test" if is_premake_config(eff_cfg) else "ctest"
+            if cmake_runtests_discover_active(eff_cfg):
+                runner = "runtests.pl"
+            elif is_premake_config(eff_cfg):
+                runner = "premake5 test"
+            else:
+                runner = "ctest"
     else:
         runner = "pytest"
     harness_label = "harness-instance" if build_instance_harness_images else "harness-env"
@@ -851,14 +944,49 @@ def _docker_pytest_attempt(
     base_result, patch_result = _result_paths(
         work, lang, result_format=result_fmt, install_config=eff_cfg
     )
-    n_base = test_reported_count(base_result, lang, result_format=result_fmt)
-    n_patch = test_reported_count(patch_result, lang, result_format=result_fmt)
+    base_map = parse_test_status_map(base_result, repo_root, lang, result_format=result_fmt)
+    patch_map = parse_test_status_map(patch_result, repo_root, lang, result_format=result_fmt)
+    refine_junit = False
+    if lang == "ruby" and pytest_targets:
+        from .ruby_build import refine_ruby_junit_maps_for_discover
+
+        base_map, patch_map = refine_ruby_junit_maps_for_discover(
+            base_map,
+            patch_map,
+            test_patch_paths=pytest_targets,
+            work_dir=work,
+        )
+        refine_junit = True
+    elif lang == "python" and pytest_targets:
+        from .python_build import refine_python_junit_maps_for_discover
+
+        base_map, patch_map = refine_python_junit_maps_for_discover(
+            base_map,
+            patch_map,
+            test_patch_paths=pytest_targets,
+            work_dir=work,
+            test_patch=str(row.get("test_patch") or ""),
+        )
+        refine_junit = True
+    n_base = (
+        len(base_map)
+        if refine_junit and pytest_targets
+        else test_reported_count(base_result, lang, result_format=result_fmt)
+    )
+    n_patch = (
+        len(patch_map)
+        if refine_junit and pytest_targets
+        else test_reported_count(patch_result, lang, result_format=result_fmt)
+    )
     java_gradle = (
         lang == "java" and str(eff_cfg.get("java_build_system") or "").lower() == "gradle"
     )
     from .c_build import is_premake_config
 
     premake_two_phase = lang == "c" and is_premake_config(eff_cfg)
+    from .runtests_build import cmake_runtests_discover_active
+
+    cmake_runtests_two_phase = lang == "c" and cmake_runtests_discover_active(eff_cfg)
     native_c_pytest = lang == "c" and bool(eff_cfg.get("native_integration_build"))
     two_phase_js = lang == "javascript"
     two_phase_py = lang == "python" or native_c_pytest
@@ -869,6 +997,7 @@ def _docker_pytest_attempt(
     two_phase = (
         java_gradle
         or premake_two_phase
+        or cmake_runtests_two_phase
         or two_phase_js
         or two_phase_py
         or two_phase_rust
@@ -895,6 +1024,26 @@ def _docker_pytest_attempt(
             f"{_docker_log_tail_for_display(dstderr, dstdout, max_len=3000)}",
             file=sys.stderr,
         )
+        for log_name in ("test-base.log", "test-patch.log"):
+            log_path = work / log_name
+            if not log_path.is_file():
+                continue
+            try:
+                tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+            except OSError:
+                tail = ""
+            if tail.strip():
+                print(
+                    f"  {pr.instance_id}: gradle {log_name} tail:\n{tail}",
+                    file=sys.stderr,
+                )
+        for phase in ("base", "patch"):
+            phase_log = _read_phase_gradle_log(work, phase)
+            if phase_log.strip():
+                print(
+                    f"  {pr.instance_id}: gradle {phase} phase log tail:\n{phase_log[-4000:]}",
+                    file=sys.stderr,
+                )
     if lang == "javascript" and n_patch == 0 and pytest_targets:
         patch_log = _read_phase_gradle_log(work, "patch")
         print(
@@ -927,6 +1076,27 @@ def _docker_pytest_attempt(
                     f"  {pr.instance_id}: ruby {log_name} tail:\n{tail}",
                     file=sys.stderr,
                 )
+    if lang == "php" and n_patch == 0 and pytest_targets:
+        print(
+            f"  {pr.instance_id}: php junit empty — check test-patch.log, "
+            f"impl.patch apply, and simple-phpunit scope. "
+            f"docker stderr/stdout tail:\n"
+            f"{_docker_log_tail_for_display(dstderr, dstdout, max_len=3000)}",
+            file=sys.stderr,
+        )
+        for log_name in ("test-base.log", "test-patch.log"):
+            log_path = work / log_name
+            if not log_path.is_file():
+                continue
+            try:
+                tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+            except OSError:
+                tail = ""
+            if tail.strip():
+                print(
+                    f"  {pr.instance_id}: php {log_name} tail:\n{tail}",
+                    file=sys.stderr,
+                )
     if (
         (lang == "python" or native_c_pytest)
         and n_patch == 0
@@ -953,8 +1123,6 @@ def _docker_pytest_attempt(
             f"{_docker_log_tail_for_display(dstderr, dstdout, max_len=3000)}",
             file=sys.stderr,
         )
-    base_map = parse_test_status_map(base_result, repo_root, lang, result_format=result_fmt)
-    patch_map = parse_test_status_map(patch_result, repo_root, lang, result_format=result_fmt)
     if (
         lang == "java"
         and str(eff_cfg.get("java_build_system") or "").lower() == "gradle"
@@ -1073,6 +1241,17 @@ def _docker_pytest_attempt(
     after_patch_empty = bool(
         tp_only and n_base > 0 and len(patch_map) == 0 and n_patch == 0
     )
+    if lang == "ruby" and after_patch_empty:
+        from .ruby_build import rspec_log_indicates_all_passed
+
+        patch_log = work / "test-patch.log"
+        if patch_log.is_file() and rspec_log_indicates_all_passed(
+            patch_log.read_text(encoding="utf-8", errors="replace")
+        ):
+            after_patch_empty = False
+    from .harness_guards import log_indicates_patch_apply_failed
+
+    patch_apply_failed = r.returncode != 0 and log_indicates_patch_apply_failed(log_tail)
 
     return {
         "f2p": f2p,
@@ -1087,6 +1266,7 @@ def _docker_pytest_attempt(
         "tot": tot,
         "test_patch_label_mismatch": tp_mismatch,
         "after_patch_empty": after_patch_empty,
+        "patch_apply_failed": patch_apply_failed,
         "install_failed": install_failed,
         "fl": fl,
         "el": el,
@@ -1160,6 +1340,7 @@ def discover_fail_to_pass_pass_to_pass_docker(
     patch = str(row.get("patch") or "")
     test_patch = str(row.get("test_patch") or "")
     base_commit = str(row.get("base_commit") or "")
+    head_sha = str(row.get("head_commit") or "")
     test_patch_created_by_llm = False
     need_llm_test_patch = False
 
@@ -1192,20 +1373,32 @@ def discover_fail_to_pass_pass_to_pass_docker(
     targets = collect_test_targets(lang, patch, test_patch)
     if lang == "c":
         from .integration_build import merge_hybrid_c_integration_paths
+        from .runtests_build import cmake_runtests_discover_active, collect_runtests_numbers
 
         _detection, runner = merge_hybrid_c_integration_paths(
             patch, test_patch, language=lang, test_paths=targets
         )
         if runner:
             targets = runner
+        else:
+            from .integration_build import patch_diff_touches_libtest
+            from .runtests_build import collect_runtests_numbers
+
+            if patch_diff_touches_libtest(test_patch):
+                nums = collect_runtests_numbers(test_patch)
+                if nums:
+                    targets = [f"tests/data/test{n}" for n in nums]
+                elif _detection:
+                    targets = _detection
     if not targets:
         targets = collect_heuristic_test_paths_from_patch(
             "\n".join(p for p in (patch, test_patch) if p.strip())
         )
     if lang == "python":
         from .languages import filter_python_pytest_targets
+        from .python_build import expand_pytest_discover_targets
 
-        targets = filter_python_pytest_targets(targets)
+        targets = expand_pytest_discover_targets(filter_python_pytest_targets(targets))
     if not targets and not need_llm_test_patch:
         print(
             f"  {pr.instance_id}: no test paths for language={lang} in patches; skip docker discover",
@@ -1281,7 +1474,12 @@ def discover_fail_to_pass_pass_to_pass_docker(
 
             ok_apply, apply_err = validate_git_patch(test_body, repo)
             if not ok_apply:
-                recovered = recover_patches_heuristic(pr, repo)
+                recovered = recover_patches_heuristic(
+                    pr,
+                    repo,
+                    base_commit=base_commit,
+                    head_sha=head_sha,
+                )
                 if recovered is not None:
                     patch, test_patch = recovered
                     impl_body = strip_mailbox_to_unified(patch)
@@ -1309,6 +1507,9 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     problem_statement=str(row.get("problem_statement") or ""),
                     impl_patch=patch,
                     instance_id=pr.instance_id,
+                    test_paths=tp_collect or targets,
+                    base_commit=base_commit,
+                    head_sha=head_sha,
                 )
                 if not ok:
                     print(
@@ -1327,6 +1528,48 @@ def discover_fail_to_pass_pass_to_pass_docker(
                 )
                 return [], [], ""
 
+        from .patch_validate import (
+            PatchSplitUnrecoverableError,
+            ensure_patch_commits_fetched,
+            ensure_patches_for_base,
+            validate_git_patch_stack,
+        )
+
+        patch = str(row.get("patch") or patch)
+        test_patch = str(row.get("test_patch") or test_patch)
+        impl_body = strip_mailbox_to_unified(patch)
+        test_body = strip_mailbox_to_unified(test_patch)
+        if base_commit.strip() and head_sha.strip():
+            ensure_patch_commits_fetched(repo, base_commit, head_sha)
+            try:
+                patch, test_patch = ensure_patches_for_base(
+                    pr,
+                    repo,
+                    base_commit=base_commit,
+                    head_sha=head_sha,
+                    patch=patch,
+                    test_patch=test_patch,
+                    diff="",
+                    llm_split_used=False,
+                    language=lang,
+                )
+                impl_body = strip_mailbox_to_unified(patch)
+                test_body = strip_mailbox_to_unified(test_patch)
+                row["patch"] = patch
+                row["test_patch"] = test_patch
+            except PatchSplitUnrecoverableError as ex:
+                print(f"  {pr.instance_id}: skip — {ex}", file=sys.stderr)
+                return [], [], ""
+        else:
+            ok_stack, stack_err = validate_git_patch_stack(test_body, impl_body, repo)
+            if not ok_stack:
+                print(
+                    f"  {pr.instance_id}: skip — stacked patch apply failed pre-Docker: "
+                    f"{stack_err}",
+                    file=sys.stderr,
+                )
+                return [], [], ""
+
         (work / "impl.patch").write_text(impl_body, encoding="utf-8")
         (work / "test.patch").write_text(test_body, encoding="utf-8")
 
@@ -1336,6 +1579,7 @@ def discover_fail_to_pass_pass_to_pass_docker(
         eff_cfg = _docker_install_config_effective(install_config, pr, repo=repo)
         if lang == "python" and repo is not None:
             from .integration_build import apply_native_build_if_integration
+            from .python_build import merge_python_build_into_config
 
             from .apt_from_log import sanitize_native_integration_apt_config
 
@@ -1346,6 +1590,17 @@ def discover_fail_to_pass_pass_to_pass_docker(
                 test_patch=test_patch,
             )
             eff_cfg = sanitize_native_integration_apt_config(eff_cfg)
+            eff_cfg = merge_python_build_into_config(
+                eff_cfg,
+                repo,
+                pytest_targets,
+                repo_id=str(row.get("repo") or pr.repo_id),
+            )
+            print(
+                f"  {pr.instance_id}: python test_cmd="
+                f"{str(eff_cfg.get('test_cmd') or '')[:80]!r}",
+                file=sys.stderr,
+            )
         if lang == "java":
             eff_cfg = merge_java_build_into_config(
                 eff_cfg,
@@ -1420,46 +1675,50 @@ def discover_fail_to_pass_pass_to_pass_docker(
                 file=sys.stderr,
             )
         elif lang == "c":
+            from .c_harness_router import apply_c_harness_router, c_harness_runner_label
             from .integration_build import (
-                apply_native_build_if_integration,
+                filter_integration_pytest_modules,
+                merge_hybrid_c_integration_paths,
                 native_integration_discover_active,
             )
+            from .runtests_build import collect_runtests_numbers
 
             impl_patch = str(row.get("patch") or "")
-            eff_cfg = apply_native_build_if_integration(
+            eff_cfg = apply_c_harness_router(
                 eff_cfg,
                 repo,
-                test_paths=tp_only or pytest_targets,
-                test_patch=test_patch,
                 patch=impl_patch,
+                test_patch=test_patch,
+                test_paths=tp_only or pytest_targets,
             )
             from .apt_from_log import sanitize_native_integration_apt_config
 
             eff_cfg = sanitize_native_integration_apt_config(eff_cfg)
-            if not native_integration_discover_active(eff_cfg):
-                from .c_build import ensure_c_install_config
-
-                eff_cfg = ensure_c_install_config(
-                    eff_cfg,
-                    repo=repo,
-                    test_paths=tp_only or pytest_targets,
-                    test_patch=test_patch,
-                )
             eff_cfg["language"] = "c"
             if native_integration_discover_active(eff_cfg):
-                from .integration_build import merge_hybrid_c_integration_paths
-
                 _det, runner = merge_hybrid_c_integration_paths(
                     impl_patch, test_patch, language="c"
                 )
                 if runner:
                     tp_only = _test_patch_only_targets("c", test_patch) or runner
                     pytest_targets = tp_only if tp_only else runner
-            runner_note = (
-                "pytest (native integration)"
-                if native_integration_discover_active(eff_cfg)
-                else str(eff_cfg.get("c_build_system") or "cmake")
-            )
+                runnable = filter_integration_pytest_modules(pytest_targets)
+                if not runnable:
+                    print(
+                        f"  {pr.instance_id}: skip docker discover — native integration "
+                        f"router selected pytest but no runnable test_*.py in test_patch "
+                        f"(got {pytest_targets!r})",
+                        file=sys.stderr,
+                    )
+                    return [], [], ""
+                pytest_targets = runnable
+                tp_only = runnable
+            elif eff_cfg.get("cmake_runtests_build"):
+                nums = collect_runtests_numbers(test_patch)
+                if nums:
+                    tp_only = [f"tests/data/test{n}" for n in nums]
+                    pytest_targets = tp_only
+            runner_note = c_harness_runner_label(eff_cfg)
             print(
                 f"  {pr.instance_id}: c build_system={runner_note} apt-pkgs="
                 f"{(eff_cfg.get('apt-pkgs') or [])!r} "
@@ -1527,12 +1786,35 @@ def discover_fail_to_pass_pass_to_pass_docker(
             sl = last_metrics["sl"]
             install_failed = bool(last_metrics["install_failed"])
             last_slice_fa, last_slice_ea, last_slice_sk = fa, ea, sk
-            last_install_failed = install_failed
             last_n_base = int(last_metrics["n_base"])
             last_n_patch = int(last_metrics["n_patch"])
             last_tp_tot = tot
+            log_tail = (last_metrics.get("dstderr") or "") + "\n" + (
+                last_metrics.get("dstdout") or ""
+            )
+            build_failed = False
+            test_target_failed = False
+            if lang == "java":
+                from .harness_guards import (
+                    log_indicates_gradle_build_failed_during_tests,
+                    log_indicates_gradle_no_tests_found_for_includes,
+                )
+
+                test_target_failed = log_indicates_gradle_no_tests_found_for_includes(
+                    log_tail, n_patch=last_n_patch
+                )
+                build_failed = (
+                    log_indicates_gradle_build_failed_during_tests(log_tail)
+                    and last_n_patch == 0
+                    and not test_target_failed
+                )
+                if install_failed and (build_failed or test_target_failed):
+                    install_failed = False
+            last_install_failed = install_failed
             if last_metrics.get("testbed_ready"):
                 setup_ready = True
+            if not bool(last_metrics.get("after_patch_empty")):
+                eff_cfg.pop("discovery_patch_full_suite", None)
 
             if not install_failed and (last_n_patch > 0 or len(f2p) > 0):
                 if docker_pip_freeze_after:
@@ -1551,6 +1833,20 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     f"{stats_tail} (from install_config run, attempt {attempt})",
                     file=sys.stderr,
                 )
+            elif build_failed:
+                print(
+                    f"  {pr.instance_id}: gradle BUILD FAILED on attempt {attempt} "
+                    f"(not install failure); "
+                    f"keeping prior FAIL_TO_PASS={len(f2p)} PASS_TO_PASS={len(p2p)}",
+                    file=sys.stderr,
+                )
+            elif test_target_failed:
+                print(
+                    f"  {pr.instance_id}: gradle --tests filter matched no tests on "
+                    f"attempt {attempt} (wrong module/FQCN, not install); "
+                    f"keeping prior FAIL_TO_PASS={len(f2p)} PASS_TO_PASS={len(p2p)}",
+                    file=sys.stderr,
+                )
             elif install_failed:
                 print(
                     f"  {pr.instance_id}: install failed on attempt {attempt}; "
@@ -1566,28 +1862,67 @@ def discover_fail_to_pass_pass_to_pass_docker(
 
             fixable_sk = _has_fixable_env_skips(sl)
             slice_only_errors = bool(tp_only) and (fa + ea) > 0 and not install_failed
-            log_tail = (last_metrics.get("dstderr") or "") + "\n" + (last_metrics.get("dstdout") or "")
             junit_empty = (
                 not install_failed
                 and len(pytest_targets or targets) > 0
                 and last_n_patch == 0
-                and lang in ("java", "javascript", "python")
+                and lang in ("java", "javascript", "python", "php")
             )
-            needs_junit_fix = junit_empty and (
-                lang == "javascript"
-                or log_indicates_maven_tests_ran(log_tail)
-                or log_indicates_gradle_build_ok(log_tail)
-                or (
-                    lang == "python"
-                    and native_integration_already_applied(eff_cfg)
+            gradle_module_mismatch = False
+            if lang == "java":
+                from .java_build import log_indicates_gradle_module_slice_mismatch
+                from .harness_guards import log_indicates_gradle_no_tests_found_for_includes
+
+                gradle_module_mismatch = (
+                    log_indicates_gradle_module_slice_mismatch(
+                        n_base=last_n_base,
+                        n_patch=last_n_patch,
+                        tp_tot=last_tp_tot,
+                    )
+                    or test_target_failed
+                    or log_indicates_gradle_no_tests_found_for_includes(
+                        log_tail, n_patch=last_n_patch
+                    )
+                )
+            after_patch_empty = bool(last_metrics.get("after_patch_empty"))
+            patch_apply_failed = bool(last_metrics.get("patch_apply_failed"))
+            patch_junit_ok = (
+                not install_failed
+                and last_n_patch > 0
+                and last_tp_tot > 0
+                and not patch_apply_failed
+            )
+            if patch_junit_ok:
+                test_target_failed = False
+                gradle_module_mismatch = False
+            needs_junit_fix = (
+                junit_empty
+                and not after_patch_empty
+                and not patch_apply_failed
+                and (
+                    lang == "javascript"
+                    or lang == "php"
+                    or log_indicates_maven_tests_ran(log_tail)
+                    or log_indicates_gradle_build_ok(log_tail)
+                    or gradle_module_mismatch
+                    or (
+                        lang == "python"
+                        and native_integration_already_applied(eff_cfg)
+                    )
                 )
             )
-            needs_fix = install_failed or needs_junit_fix or (
-                (ea > 0 or (remediate_skips and fixable_sk)) and not slice_only_errors
+            needs_fix = (
+                install_failed
+                or build_failed
+                or test_target_failed
+                or needs_junit_fix
+                or (
+                    (ea > 0 or (remediate_skips and fixable_sk)) and not slice_only_errors
+                )
             )
             if slice_only_errors and not install_failed:
                 from .python_build import (
-                    augment_python_install_config,
+                    finalize_python_install_config,
                     needs_dateutil_zoneinfo,
                     slice_failures_are_dateutil_zoneinfo,
                 )
@@ -1601,8 +1936,8 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     )
                 )
                 if zoneinfo_env and not last_metrics.get("dateutil_zoneinfo_retried"):
-                    eff_cfg = augment_python_install_config(
-                        eff_cfg, repo=repo, repo_id=pr.repo_id
+                    eff_cfg = finalize_python_install_config(
+                        eff_cfg, repo, repo_id=pr.repo_id
                     )
                     row["install_config"] = export_install_config_for_harness(eff_cfg)
                     print(
@@ -1677,6 +2012,37 @@ def discover_fail_to_pass_pass_to_pass_docker(
                         file=sys.stderr,
                     )
                     continue
+            if (
+                after_patch_empty
+                and not install_failed
+                and not last_metrics.get("full_suite_probe_done")
+                and lang in ("php", "ruby")
+                and attempt < max_r
+            ):
+                eff_cfg = dict(eff_cfg)
+                eff_cfg["discovery_patch_full_suite"] = True
+                last_metrics["full_suite_probe_done"] = True
+                print(
+                    f"  {pr.instance_id}: patch phase empty (base={last_n_base}, "
+                    f"patch junit=0) — re-running Docker with full-suite patch probe",
+                    file=sys.stderr,
+                )
+                continue
+            if after_patch_empty and not install_failed:
+                eff_cfg.pop("discovery_patch_full_suite", None)
+                print(
+                    f"  {pr.instance_id}: patch phase empty — skipping install_config "
+                    f"remediation (test_patch LLM / logs)",
+                    file=sys.stderr,
+                )
+                break
+            if patch_apply_failed and not install_failed:
+                print(
+                    f"  {pr.instance_id}: patch apply failed — skipping install_config "
+                    f"remediation",
+                    file=sys.stderr,
+                )
+                break
             if not needs_fix:
                 if sk > 0 and fixable_sk:
                     print(
@@ -1701,24 +2067,23 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     )
                 break
 
-            if install_failed:
+            if build_failed:
+                reason = "gradle build failed during test (fix compile/install, not test_cmd)"
+            elif test_target_failed:
+                reason = (
+                    "gradle --tests filter matched no tests (fix module/FQCN, not install)"
+                )
+            elif install_failed:
                 reason = "install failed"
             elif needs_junit_fix:
-                if lang == "javascript":
-                    js_runner = str(eff_cfg.get("js_test_runner") or "jest")
-                    if js_runner == "vitest":
-                        reporter = "vitest junit reporter"
-                    elif js_runner == "mocha":
-                        reporter = "mocha-junit-reporter"
-                    else:
-                        reporter = "jest-junit"
-                    reason = f"junit empty (fix test_cmd / {reporter} / targets)"
-                elif lang == "python":
-                    reason = (
-                        "junit empty (fix test_cmd / integration pytest root / CI env)"
-                    )
-                else:
-                    reason = "junit empty but Maven/Gradle ran (fix test_cmd / junit roots)"
+                from .harness_guards import needs_junit_fix_reason
+
+                reason = needs_junit_fix_reason(
+                    lang,
+                    n_base=last_n_base,
+                    n_patch=last_n_patch,
+                    log_tail=log_tail,
+                )
             elif ea > 0:
                 reason = "test collection/setup errors"
             else:
@@ -1729,7 +2094,96 @@ def discover_fail_to_pass_pass_to_pass_docker(
                 file=sys.stderr,
             )
 
+            log_tail_fix = (last_metrics.get("dstdout") or "") + "\n" + (
+                last_metrics.get("dstderr") or ""
+            )
+            if install_failed and log_indicates_git_clone_failure(
+                log_tail_fix, docker_exit=int(last_metrics.get("docker_exit") or 0)
+            ):
+                if attempt < max_r:
+                    print(
+                        f"  {pr.instance_id}: git checkout failed — re-running Docker "
+                        f"(fetch fallback for unreachable base_commit)",
+                        file=sys.stderr,
+                    )
+                    continue
+                break
+
             cfg_before_fix = dict(eff_cfg)
+            from .harness_guards import extract_structured_failure_log
+
+            if not build_failed:
+                log_tail_fix = extract_structured_failure_log(
+                    log_tail_fix, language=lang
+                )
+            if build_failed:
+                if repo is not None and lang == "java":
+                    heuristic_cfg = merge_java_build_into_config(
+                        eff_cfg,
+                        repo,
+                        pytest_targets or targets,
+                        llm=None,
+                        repo_id=str(row.get("repo") or pr.repo_id),
+                        instance_id=pr.instance_id,
+                    )
+                    heuristic_cfg = _docker_install_config_effective(
+                        heuristic_cfg, pr, repo=repo
+                    )
+                    if not install_config_remediation_unchanged(eff_cfg, heuristic_cfg):
+                        eff_cfg = heuristic_cfg
+                        row["install_config"] = export_install_config_for_harness(
+                            eff_cfg, language=lang
+                        )
+                        last_env_fp = install_config_affects_env_image(eff_cfg)
+                        print(
+                            f"  {pr.instance_id}: applied Gradle compile install heuristics "
+                            f"(install={str(eff_cfg.get('install') or '')[:100]!r}); "
+                            f"re-running Docker",
+                            file=sys.stderr,
+                        )
+                        continue
+                print(
+                    f"  {pr.instance_id}: gradle BUILD FAILED — compile/install heuristics "
+                    f"unchanged; skipping install-config LLM",
+                    file=sys.stderr,
+                )
+                break
+            if test_target_failed and lang == "java" and repo is not None:
+                print(
+                    f"  {pr.instance_id}: Gradle module/FQCN mismatch "
+                    f"(no tests for --tests filter) — re-resolving modules without LLM",
+                    file=sys.stderr,
+                )
+                heuristic_cfg = merge_java_build_into_config(
+                    eff_cfg,
+                    repo,
+                    pytest_targets or targets,
+                    llm=None,
+                    repo_id=str(row.get("repo") or pr.repo_id),
+                    instance_id=pr.instance_id,
+                )
+                heuristic_cfg = _docker_install_config_effective(
+                    heuristic_cfg, pr, repo=repo
+                )
+                if not install_config_remediation_unchanged(eff_cfg, heuristic_cfg):
+                    eff_cfg = heuristic_cfg
+                    row["install_config"] = export_install_config_for_harness(
+                        eff_cfg, language=lang
+                    )
+                    last_env_fp = install_config_affects_env_image(eff_cfg)
+                    print(
+                        f"  {pr.instance_id}: applied Java test_cmd/module heuristics "
+                        f"(test_cmd={str(eff_cfg.get('test_cmd') or '')[:100]!r}); "
+                        f"re-running Docker",
+                        file=sys.stderr,
+                    )
+                    continue
+                print(
+                    f"  {pr.instance_id}: Gradle test-target heuristics unchanged; "
+                    f"skipping install-config LLM",
+                    file=sys.stderr,
+                )
+                break
             if install_failed and lang == "java":
                 log_tail = (last_metrics.get("dstdout") or "") + "\n" + (
                     last_metrics.get("dstderr") or ""
@@ -1762,11 +2216,19 @@ def discover_fail_to_pass_pass_to_pass_docker(
                         )
                         continue
             if needs_junit_fix and lang == "java":
+                java_llm = None if gradle_module_mismatch else llm_remediate
+                if gradle_module_mismatch:
+                    print(
+                        f"  {pr.instance_id}: Gradle module slice mismatch "
+                        f"(base={last_n_base}, patch={last_n_patch}, "
+                        f"test_patch_matched={last_tp_tot}) — re-resolving modules without LLM",
+                        file=sys.stderr,
+                    )
                 heuristic_cfg = merge_java_build_into_config(
                     eff_cfg,
                     repo,
                     pytest_targets or targets,
-                    llm=llm_remediate if lang == "java" else None,
+                    llm=java_llm,
                     repo_id=str(row.get("repo") or pr.repo_id),
                     instance_id=pr.instance_id,
                 )
@@ -1778,6 +2240,23 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     print(
                         f"  {pr.instance_id}: applied Java test_cmd/module heuristics "
                         f"(test_cmd={str(eff_cfg.get('test_cmd') or '')[:100]!r}); re-running Docker",
+                        file=sys.stderr,
+                    )
+                    continue
+            if needs_junit_fix and lang == "php" and repo is not None:
+                from .php_build import php_install_config_for_repo
+
+                heuristic_cfg = php_install_config_for_repo(repo, base=eff_cfg)
+                heuristic_cfg = _docker_install_config_effective(heuristic_cfg, pr, repo=repo)
+                if not install_config_remediation_unchanged(eff_cfg, heuristic_cfg):
+                    eff_cfg = heuristic_cfg
+                    row["install_config"] = export_install_config_for_harness(eff_cfg, language=lang)
+                    last_env_fp = install_config_affects_env_image(eff_cfg)
+                    print(
+                        f"  {pr.instance_id}: applied PHP test_cmd/runner heuristics "
+                        f"(runner={eff_cfg.get('php_test_runner')!r}, "
+                        f"test_cmd={str(eff_cfg.get('test_cmd') or '')[:100]!r}); "
+                        f"re-running Docker",
                         file=sys.stderr,
                     )
                     continue
@@ -1833,7 +2312,15 @@ def discover_fail_to_pass_pass_to_pass_docker(
                         file=sys.stderr,
                     )
                     continue
-            if install_failed and lang in ("c", "go", "rust", "ruby", "php", "python", "javascript"):
+            if install_failed and not build_failed and lang in (
+                "c",
+                "go",
+                "rust",
+                "ruby",
+                "php",
+                "python",
+                "javascript",
+            ):
                 log_tail = (last_metrics.get("dstdout") or "") + "\n" + (
                     last_metrics.get("dstderr") or ""
                 )
@@ -1858,7 +2345,30 @@ def discover_fail_to_pass_pass_to_pass_docker(
                         native_build_install_config,
                     )
 
-                    if native_integration_already_applied(eff_cfg) and repo is not None:
+                    from .harness_guards import log_indicates_ngtcp2_quictls_missing
+                    from .integration_build import remediate_quictls_native_integration
+
+                    if log_indicates_ngtcp2_quictls_missing(log_tail):
+                        if repo is not None:
+                            heuristic_cfg = remediate_quictls_native_integration(
+                                eff_cfg,
+                                repo,
+                                test_paths=tp_only or pytest_targets,
+                            )
+                        else:
+                            heuristic_cfg = remediate_c_install_from_log(
+                                eff_cfg,
+                                log_tail,
+                                repo=repo,
+                                test_paths=tp_only or pytest_targets,
+                            )
+                        print(
+                            f"  {pr.instance_id}: stripped HTTP/3 cmake flags "
+                            f"(ngtcp2 quictls missing)",
+                            file=sys.stderr,
+                        )
+                        force_rebuild_env_next = True
+                    elif native_integration_already_applied(eff_cfg) and repo is not None:
                         heuristic_cfg = native_build_install_config(
                             eff_cfg,
                             repo,
@@ -1866,7 +2376,12 @@ def discover_fail_to_pass_pass_to_pass_docker(
                             test_patch=test_patch,
                         )
                     else:
-                        heuristic_cfg = remediate_c_install_from_log(eff_cfg, log_tail, repo=repo)
+                        heuristic_cfg = remediate_c_install_from_log(
+                            eff_cfg,
+                            log_tail,
+                            repo=repo,
+                            test_paths=tp_only or pytest_targets,
+                        )
                     if repo is not None and is_premake_repo(repo):
                         heuristic_cfg = premake_install_config_for_repo(
                             repo,
@@ -1875,17 +2390,30 @@ def discover_fail_to_pass_pass_to_pass_docker(
                             test_patch=test_patch,
                         )
                     if repo is not None:
-                        heuristic_cfg = apply_native_build_if_integration(
-                            heuristic_cfg,
-                            repo,
-                            test_paths=tp_only or pytest_targets,
-                            test_patch=test_patch,
-                            patch=str(row.get("patch") or ""),
-                        )
+                        from .integration_build import native_integration_http3_disabled
+
+                        if not native_integration_http3_disabled(heuristic_cfg):
+                            heuristic_cfg = apply_native_build_if_integration(
+                                heuristic_cfg,
+                                repo,
+                                test_paths=tp_only or pytest_targets,
+                                test_patch=test_patch,
+                                patch=str(row.get("patch") or ""),
+                            )
                 elif lang == "ruby":
-                    from .ruby_build import remediate_ruby_install_from_log
+                    from .ruby_build import (
+                        log_indicates_ruby_gem_not_found,
+                        remediate_ruby_install_from_log,
+                        ruby_install_config_for_repo,
+                    )
 
                     heuristic_cfg = remediate_ruby_install_from_log(eff_cfg, log_tail)
+                    if repo is not None and log_indicates_ruby_gem_not_found(log_tail):
+                        heuristic_cfg = ruby_install_config_for_repo(
+                            repo,
+                            base=heuristic_cfg,
+                            test_paths=tp_only or pytest_targets,
+                        )
                 elif lang == "rust":
                     from .rust_build import remediate_rust_install_from_log
 
@@ -1895,7 +2423,7 @@ def discover_fail_to_pass_pass_to_pass_docker(
                 elif lang == "php":
                     from .php_build import remediate_php_install_from_log
 
-                    heuristic_cfg = remediate_php_install_from_log(eff_cfg, log_tail)
+                    heuristic_cfg = remediate_php_install_from_log(eff_cfg, log_tail, repo=repo)
                 elif lang == "go":
                     from .go_build import remediate_go_install_from_log
 
@@ -1906,14 +2434,30 @@ def discover_fail_to_pass_pass_to_pass_docker(
                         n_patch=int(last_metrics.get("n_patch") or 0),
                     )
                 elif lang == "python" and repo is not None:
+                    from .harness_guards import log_indicates_ngtcp2_quictls_missing
                     from .integration_build import (
                         apply_native_build_if_integration,
                         native_build_install_config,
                         native_integration_already_applied,
+                        remediate_native_integration_ngtcp2,
                         repo_has_cmake_integration,
                     )
 
-                    if repo_has_cmake_integration(
+                    from .integration_build import remediate_quictls_native_integration
+
+                    if log_indicates_ngtcp2_quictls_missing(log_tail):
+                        heuristic_cfg = remediate_quictls_native_integration(
+                            eff_cfg,
+                            repo,
+                            test_paths=tp_only or pytest_targets,
+                        )
+                        print(
+                            f"  {pr.instance_id}: stripped HTTP/3 cmake flags "
+                            f"(ngtcp2 quictls missing)",
+                            file=sys.stderr,
+                        )
+                        force_rebuild_env_next = True
+                    elif repo_has_cmake_integration(
                         repo, test_paths=tp_only or pytest_targets
                     ) and not native_integration_already_applied(eff_cfg):
                         heuristic_cfg = native_build_install_config(
@@ -1925,40 +2469,56 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     elif native_integration_already_applied(eff_cfg):
                         heuristic_cfg = dict(eff_cfg)
                     else:
-                        from .apt_from_log import remediate_apt_install_from_log
+                        from .python_build import remediate_python_install_from_log
 
-                        heuristic_cfg = remediate_apt_install_from_log(eff_cfg, log_tail)
+                        heuristic_cfg = remediate_python_install_from_log(
+                            eff_cfg,
+                            log_tail,
+                            repo=repo,
+                            docker_exit=int(last_metrics.get("docker_exit") or 0),
+                        )
                 else:
                     from .apt_from_log import remediate_apt_install_from_log
 
                     heuristic_cfg = remediate_apt_install_from_log(eff_cfg, log_tail)
                 heuristic_cfg = _docker_install_config_effective(heuristic_cfg, pr, repo=repo)
                 if lang in ("python", "c") and repo is not None:
-                    from .integration_build import apply_native_build_if_integration
-
-                    heuristic_cfg = apply_native_build_if_integration(
-                        heuristic_cfg,
-                        repo,
-                        test_paths=tp_only or pytest_targets,
-                        test_patch=test_patch,
-                        patch=str(row.get("patch") or ""),
+                    from .integration_build import (
+                        apply_native_build_if_integration,
+                        native_integration_http3_disabled,
                     )
+
+                    if not native_integration_http3_disabled(heuristic_cfg):
+                        heuristic_cfg = apply_native_build_if_integration(
+                            heuristic_cfg,
+                            repo,
+                            test_paths=tp_only or pytest_targets,
+                            test_patch=test_patch,
+                            patch=str(row.get("patch") or ""),
+                        )
                     from .apt_from_log import sanitize_native_integration_apt_config
 
                     heuristic_cfg = sanitize_native_integration_apt_config(heuristic_cfg)
                     if lang == "c":
                         heuristic_cfg["language"] = "c"
                 if not install_config_remediation_unchanged(eff_cfg, heuristic_cfg):
+                    cfg_before_heuristic = dict(eff_cfg)
                     eff_cfg = heuristic_cfg
                     row["install_config"] = export_install_config_for_harness(eff_cfg, language=lang)
                     last_env_fp = install_config_affects_env_image(eff_cfg)
-                    apt = eff_cfg.get("apt-pkgs") or []
+                    if install_config_substantive_change(cfg_before_heuristic, eff_cfg):
+                        apt = eff_cfg.get("apt-pkgs") or []
+                        print(
+                            f"  {pr.instance_id}: applied {lang} install heuristics "
+                            f"(apt-pkgs={apt!r}); re-running Docker",
+                            file=sys.stderr,
+                        )
+                        continue
                     print(
-                        f"  {pr.instance_id}: applied {lang} apt/install heuristics "
-                        f"(apt-pkgs={apt!r}); re-running Docker",
+                        f"  {pr.instance_id}: applied {lang} apt-only heuristics; "
+                        f"proceeding to LLM install_config update",
                         file=sys.stderr,
                     )
-                    continue
 
             blob = _llm_diagnostics_blob(
                 pr,
@@ -1972,7 +2532,7 @@ def discover_fail_to_pass_pass_to_pass_docker(
                 tot=tot,
                 docker_stderr_tail=last_metrics["dstderr"],
                 docker_stdout_tail=last_metrics["dstdout"],
-                install_failed=install_failed,
+                install_failed=install_failed and not build_failed,
                 docker_exit=int(last_metrics["docker_exit"]),
                 n_patch=last_n_patch,
                 n_targets=len(targets),
@@ -1992,14 +2552,19 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     ci_context=get_ci_excerpt_from_config(eff_cfg),
                 )
                 eff_cfg = _docker_install_config_effective(eff_cfg, pr, repo=repo)
-                if install_failed:
+                if install_failed and not build_failed:
                     log_tail = (last_metrics.get("dstdout") or "") + "\n" + (
                         last_metrics.get("dstderr") or ""
                     )
                     if lang == "c":
                         from .c_build import remediate_c_install_from_log
 
-                        eff_cfg = remediate_c_install_from_log(eff_cfg, log_tail)
+                        eff_cfg = remediate_c_install_from_log(
+                            eff_cfg,
+                            log_tail,
+                            repo=repo,
+                            test_paths=tp_only or pytest_targets,
+                        )
                     elif lang == "ruby":
                         from .ruby_build import remediate_ruby_install_from_log
 
@@ -2014,6 +2579,15 @@ def discover_fail_to_pass_pass_to_pass_docker(
                         from .php_build import remediate_php_install_from_log
 
                         eff_cfg = remediate_php_install_from_log(eff_cfg, log_tail)
+                    elif lang == "python" and repo is not None:
+                        from .python_build import remediate_python_install_from_log
+
+                        eff_cfg = remediate_python_install_from_log(
+                            eff_cfg,
+                            log_tail,
+                            repo=repo,
+                            docker_exit=int(last_metrics.get("docker_exit") or 0),
+                        )
                     else:
                         from .apt_from_log import remediate_apt_install_from_log
 
@@ -2024,7 +2598,7 @@ def discover_fail_to_pass_pass_to_pass_docker(
                         eff_cfg,
                         repo,
                         pytest_targets or targets,
-                        llm=llm_remediate,
+                        llm=None if build_failed else llm_remediate,
                         repo_id=str(row.get("repo") or pr.repo_id),
                         instance_id=pr.instance_id,
                     )
@@ -2066,11 +2640,11 @@ def discover_fail_to_pass_pass_to_pass_docker(
             and (last_slice_fa + last_slice_ea) > 0
             and not last_metrics.get("dateutil_zoneinfo_retried")
         ):
-            from .python_build import augment_python_install_config, needs_dateutil_zoneinfo
+            from .python_build import finalize_python_install_config, needs_dateutil_zoneinfo
 
             if needs_dateutil_zoneinfo(repo=repo):
-                eff_cfg = augment_python_install_config(
-                    eff_cfg, repo=repo, repo_id=pr.repo_id
+                eff_cfg = finalize_python_install_config(
+                    eff_cfg, repo, repo_id=pr.repo_id
                 )
                 row["install_config"] = export_install_config_for_harness(eff_cfg)
                 print(
@@ -2155,14 +2729,31 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     patch_junit, repo_root, lang, result_format=result_fmt
                 )
                 if after_patch_empty:
-                    log_tail = ""
+                    log_parts: list[str] = []
+                    for log_name in ("test-patch.log", "test-base.log"):
+                        lp = work / log_name
+                        if lp.is_file():
+                            try:
+                                log_parts.append(
+                                    f"--- {log_name} ---\n"
+                                    + lp.read_text(encoding="utf-8", errors="replace")[-6000:]
+                                )
+                            except OSError:
+                                pass
                     if patch_junit.is_file():
-                        log_tail = patch_junit.read_text(encoding="utf-8", errors="replace")[-8000:]
+                        try:
+                            log_parts.append(
+                                "--- junit-patch.xml (tail) ---\n"
+                                + patch_junit.read_text(encoding="utf-8", errors="replace")[-4000:]
+                            )
+                        except OSError:
+                            pass
+                    log_tail = "\n".join(log_parts) if log_parts else "(no test logs found)"
                     slice_fl = [
                         (
                             "(after patch)",
-                            "runtests produced no parseable test lines after applying "
-                            "impl.patch and test.patch. Log tail:\n" + log_tail,
+                            "No parseable tests after impl.patch + test.patch. "
+                            "Use test-patch.log / impl apply errors:\n" + log_tail,
                         )
                     ]
                     slice_el = []
@@ -2327,6 +2918,8 @@ def discover_fail_to_pass_pass_to_pass_docker(
                         instance_id=pr.instance_id,
                         test_paths=tp_paths,
                         java_harness_context=java_ctx,
+                        base_commit=base_commit,
+                        head_sha=head_sha,
                     )
                     if not apply_ok:
                         print(

@@ -20,6 +20,221 @@ _PROJECT_DIR_RE = re.compile(
 _WRAPPER_DIRS = frozenset(
     {"module", "modules", "spring-boot-project", "core", "documentation", "build-plugin"}
 )
+_PRIMARY_TEST_MODULE_RE = re.compile(r"-tests-java\d", re.I)
+_JDK8_TEST_MODULE_RE = re.compile(r"-tests-java8(?:$|[-:])", re.I)
+_JDK9PLUS_TEST_MODULE_RE = re.compile(
+    r"-tests-java9plus|-tests-java1[0-9](?:plus|$|[-:])",
+    re.I,
+)
+_PACKAGE_DECL_RE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.MULTILINE)
+
+
+def _module_dir_from_test_rel(rel_path: str) -> str:
+    rel = rel_path.replace("\\", "/").strip().lstrip("/")
+    if "/src/test/" in rel:
+        return rel.split("/src/test/", 1)[0].strip("/")
+    if "/src/intTest/" in rel:
+        return rel.split("/src/intTest/", 1)[0].strip("/")
+    return ""
+
+
+def is_repo_root_java_test_rel(rel_path: str) -> bool:
+    """True when a test path lives under repo-root ``src/test/`` or ``src/intTest/``."""
+    rel = rel_path.replace("\\", "/").strip().lstrip("/")
+    return rel.startswith("src/test/") or rel.startswith("src/intTest/")
+
+
+def _is_codegen_test_module_dir(module_dir: str) -> bool:
+    name = module_dir.rsplit("/", 1)[-1].lower()
+    return "codegen" in name and "test" in name
+
+
+def _is_primary_test_module_dir(module_dir: str) -> bool:
+    name = module_dir.rsplit("/", 1)[-1]
+    if _is_codegen_test_module_dir(module_dir):
+        return False
+    return bool(
+        _PRIMARY_TEST_MODULE_RE.search(name) or _JDK9PLUS_TEST_MODULE_RE.search(name)
+    )
+
+
+def _is_jdk8_test_module_dir(module_dir: str) -> bool:
+    return bool(_JDK8_TEST_MODULE_RE.search(module_dir.rsplit("/", 1)[-1]))
+
+
+def _is_jdk9plus_test_module_dir(module_dir: str) -> bool:
+    return bool(_JDK9PLUS_TEST_MODULE_RE.search(module_dir.rsplit("/", 1)[-1]))
+
+
+def _package_needs_jdk9plus_module(pkg: str) -> bool:
+    """True when the package name suggests JDK9+ only tests."""
+    low = (pkg or "").lower()
+    return any(tok in low for tok in ("java9", "java10", "java11", "module", "jpms"))
+
+
+def _jdk_flavor_module_score(module_dir: str, pkg: str = "") -> int:
+    """
+    Prefer ``*-tests-java8`` over ``*-tests-java9plus`` for generic packages.
+
+    Picocli splits the main suite (java8) from JDK9+ API tests (java9plus).
+    """
+    if _is_jdk8_test_module_dir(module_dir):
+        return 4
+    if _is_jdk9plus_test_module_dir(module_dir):
+        if pkg and not _package_needs_jdk9plus_module(pkg):
+            return -4
+        return 1
+    return 0
+
+
+def read_java_package_from_source(path: Path) -> str | None:
+    """Read ``package`` declaration from a ``.java`` source file."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")[:8_000]
+    except OSError:
+        return None
+    m = _PACKAGE_DECL_RE.search(text)
+    return m.group(1).strip() if m else None
+
+
+def java_fqcn_from_source_file(path: Path) -> str | None:
+    """FQCN from on-disk ``package`` + public class filename."""
+    if not path.is_file() or not path.name.endswith(".java"):
+        return None
+    pkg = read_java_package_from_source(path)
+    simple = path.stem
+    if pkg:
+        return f"{pkg}.{simple}"
+    return None
+
+
+def _java_package_prefix_from_test_rel(rel_path: str) -> str:
+    rel = rel_path.replace("\\", "/")
+    for marker in ("src/test/java/", "src/intTest/java/"):
+        if marker in rel and rel.endswith(".java"):
+            pkg_path = rel.split(marker, 1)[1][:-5]
+            return pkg_path.replace("/", ".")
+    return ""
+
+
+def _score_test_file_candidate(
+    rel_path: str,
+    requested_path: str,
+    *,
+    pkg_override: str | None = None,
+) -> tuple[int, int, int, int, str]:
+    """
+    Rank on-disk test file paths when basename search returns multiple modules.
+
+    Higher is better: suffix match, PR dir prefix, primary ``*-tests-java*`` module.
+    """
+    rel = rel_path.replace("\\", "/").strip().lstrip("/")
+    req = requested_path.replace("\\", "/").strip().lstrip("/")
+    module_dir = _module_dir_from_test_rel(rel)
+
+    suffix_score = 0
+    if req and "src/test/java/" in req:
+        want_suffix = req.split("src/test/java/", 1)[1]
+        if rel.endswith("src/test/java/" + want_suffix):
+            suffix_score = 4
+        elif want_suffix in rel:
+            suffix_score = 2
+
+    prefix_score = 0
+    from .java_build import module_prefix_before_java_test
+
+    req_prefix = module_prefix_before_java_test(req)
+    if req_prefix is not None and module_dir:
+        if module_dir == req_prefix or module_dir.endswith("/" + req_prefix):
+            prefix_score = 3
+        elif req_prefix in module_dir or module_dir.endswith(req_prefix):
+            prefix_score = 1
+
+    module_score = 0
+    if _is_primary_test_module_dir(module_dir):
+        module_score = 5
+    elif _is_codegen_test_module_dir(module_dir):
+        module_score = -5
+    elif any(tok in module_dir.lower() for tok in ("example", "demo", "sample")):
+        module_score = -2
+
+    pkg = pkg_override or _java_package_prefix_from_test_rel(rel)
+    if pkg and ".codegen." in pkg:
+        module_score -= 3
+
+    if is_repo_root_java_test_rel(req):
+        if not module_dir:
+            module_score += 20
+        elif _is_primary_test_module_dir(module_dir) or _is_jdk8_test_module_dir(
+            module_dir
+        ) or _is_jdk9plus_test_module_dir(module_dir):
+            module_score -= 15
+    else:
+        module_score += _jdk_flavor_module_score(module_dir, pkg)
+
+    fqcn_match_score = 0
+    if "src/test/java/" in req and req.endswith(".java"):
+        want_class = req.rsplit("/", 1)[-1][:-5]
+        expected_fqcn = _java_package_prefix_from_test_rel(req)
+        if pkg and expected_fqcn:
+            hit_fqcn = f"{pkg}.{want_class}"
+            if hit_fqcn == expected_fqcn:
+                fqcn_match_score = 3
+
+    return (
+        suffix_score + fqcn_match_score,
+        prefix_score,
+        module_score,
+        len(module_dir),
+        module_dir,
+    )
+
+
+def _score_gradle_project_for_test(
+    proj: str,
+    rel_path: str,
+    requested_path: str,
+) -> tuple[int, int, int, int, str]:
+    """Rank Gradle project owners for a resolved on-disk test file."""
+    tail = _project_tail(proj)
+    module_dir = _module_dir_from_test_rel(rel_path)
+    file_score = _score_test_file_candidate(rel_path, requested_path)
+
+    project_score = 0
+    if _is_primary_test_module_dir(tail):
+        project_score = 5
+    elif _is_codegen_test_module_dir(tail):
+        project_score = -5
+
+    return (
+        file_score[0],
+        file_score[1],
+        file_score[2] + project_score,
+        len(module_dir),
+        tail,
+    )
+
+
+def _pick_best_test_file_hit(
+    hits: list[Path],
+    repo: Path,
+    requested_norm: str,
+) -> Path:
+    if len(hits) == 1:
+        return hits[0]
+    scored = [
+        (
+            _score_test_file_candidate(
+                h.relative_to(repo).as_posix(),
+                requested_norm,
+                pkg_override=read_java_package_from_source(h),
+            ),
+            h,
+        )
+        for h in hits
+    ]
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][1]
 
 
 @dataclass(frozen=True)
@@ -61,10 +276,19 @@ def discover_gradle_projects_from_settings(repo: Path) -> GradleProjectIndex:
             text = path.read_text(encoding="utf-8", errors="replace")[:80_000]
         except OSError:
             continue
-        for m in _INCLUDE_RE.finditer(text):
-            proj = _include_to_project(m.group(1))
-            if proj:
-                projects.add(proj)
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("include") and "include(" not in stripped:
+                continue
+            for m in re.finditer(r"""['"]([^'"]+)['"]""", line):
+                proj = _include_to_project(m.group(1))
+                if proj:
+                    projects.add(proj)
+        if not projects:
+            for m in _INCLUDE_RE.finditer(text):
+                proj = _include_to_project(m.group(1))
+                if proj:
+                    projects.add(proj)
         for m in _PROJECT_DIR_RE.finditer(text):
             proj = _normalize_gradle_project(m.group(1))
             dir_rel = m.group(2).replace("\\", "/").strip("/")
@@ -88,31 +312,296 @@ def _format_gradle_projects_block(index: GradleProjectIndex) -> str:
     return "\n".join(lines)
 
 
-def coerce_gradle_project(gp: str, index: GradleProjectIndex) -> str:
+def coerce_gradle_project(
+    gp: str,
+    index: GradleProjectIndex,
+    repo: Path | None = None,
+) -> str:
     """Map LLM/heuristic guesses onto projects declared in settings.gradle."""
     norm = _normalize_gradle_project(gp)
     if not norm:
         return norm
     if norm in index.projects:
         return norm
+    if repo is not None:
+        root = _root_gradle_project(index, repo)
+        if norm == root:
+            return root
     if norm.startswith(":module:"):
         alt = _normalize_gradle_project(norm[len(":module:") :])
         if alt in index.projects:
             return alt
     tail = norm.lstrip(":").split(":")[-1]
-    for proj in index.projects:
+    if repo is not None:
+        matches = gradle_projects_matching_short_name(tail, index, repo)
+        if matches:
+            return matches[0]
+    for proj in sorted(index.projects, key=lambda p: -len(p.lstrip(":"))):
         if proj.lstrip(":").split(":")[-1] == tail:
             return proj
     return norm
 
 
-def _fallback_map_test_path(path: str, index: GradleProjectIndex) -> str | None:
-    p = path.replace("\\", "/").strip()
-    if "/src/test/" not in p:
+_ROOT_PROJECT_NAME_RE = re.compile(
+    r"""rootProject\.name\s*=\s*['"]([^'"]+)['"]""",
+    re.MULTILINE,
+)
+
+
+def parse_root_project_name(repo: Path) -> str | None:
+    """Gradle root project name from ``settings.gradle*``."""
+    for name in ("settings.gradle.kts", "settings.gradle"):
+        path = repo / name
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")[:80_000]
+        except OSError:
+            continue
+        m = _ROOT_PROJECT_NAME_RE.search(text)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _root_gradle_project(index: GradleProjectIndex, repo: Path) -> str:
+    """Gradle path for tests under repo-root ``src/test/``."""
+    root_name = parse_root_project_name(repo)
+    if root_name:
+        return _normalize_gradle_project(root_name)
+    return ":"
+
+
+def _project_tail(project: str) -> str:
+    return _normalize_gradle_project(project).lstrip(":").split(":")[-1]
+
+
+def gradle_projects_matching_short_name(short: str, index: GradleProjectIndex, repo: Path) -> list[str]:
+    """
+    Gradle projects whose name equals ``short`` or shares a ``short-*`` prefix.
+
+    When the root is named ``picocli`` and children include ``picocli-tests-java8``,
+    ``:picocli:test`` is ambiguous — callers must use a full child path or root ``:test``.
+    """
+    name = short.lstrip(":").strip()
+    if not name:
+        return [":"]
+    hits: set[str] = set()
+    root = _root_gradle_project(index, repo)
+    if _project_tail(root) == name:
+        hits.add(root)
+    for proj in index.projects:
+        tail = _project_tail(proj)
+        if tail == name or tail.startswith(name + "-"):
+            hits.add(proj)
+
+    def _rank(proj: str) -> tuple[int, int, int, int, str]:
+        tail = _project_tail(proj)
+        if proj == root:
+            base = repo
+        elif tail:
+            base = repo / tail.replace(":", "/")
+        else:
+            base = repo
+        has_tests = (base / "src/test/java").is_dir()
+        exact = 10 if tail == name else 0
+        child = 1 if tail.startswith(name + "-") else 0
+        module_score = 0
+        if _is_primary_test_module_dir(tail):
+            module_score = 3
+        elif _is_codegen_test_module_dir(tail):
+            module_score = -3
+        if exact == 0:
+            module_score += _jdk_flavor_module_score(tail)
+        return (exact, child, 1 if has_tests else 0, module_score, len(tail), tail)
+
+    return sorted(hits, key=_rank, reverse=True)
+
+
+def is_gradle_short_name_ambiguous(short: str, index: GradleProjectIndex, repo: Path) -> bool:
+    return len(gradle_projects_matching_short_name(short, index, repo)) > 1
+
+
+def gradle_task_for_project(
+    project: str,
+    task: str,
+    index: GradleProjectIndex,
+    repo: Path,
+) -> str:
+    """
+    Qualified Gradle task (``:test``, ``:compileTestJava``, ``:sub:test``, …).
+
+    Root-project tasks use a leading colon only (``:test``) so Gradle does not expand
+    ambiguous names like ``picocli`` to every ``picocli-*`` subproject.
+    """
+    proj = _normalize_gradle_project(project) if project else ":"
+    root = _root_gradle_project(index, repo)
+    if proj == ":" or proj == root or _project_tail(proj) == _project_tail(root):
+        return f":{task}"
+    return f"{proj}:{task}"
+
+
+def gradle_test_task_for_project(project: str, index: GradleProjectIndex, repo: Path) -> str:
+    """Gradle test task name (``:test`` or ``:subproject:test``) avoiding ambiguous abbreviations."""
+    return gradle_task_for_project(project, "test", index, repo)
+
+
+def _iter_project_directory_pairs(
+    index: GradleProjectIndex, repo: Path
+) -> list[tuple[str, str]]:
+    """``(relative_dir, gradle_project_path)`` sorted longest-dir first."""
+    pairs: dict[str, str] = {}
+    root_proj = _root_gradle_project(index, repo)
+    pairs[""] = root_proj
+    for dir_rel, proj in index.dir_to_project:
+        d = dir_rel.strip("/")
+        if d:
+            pairs[d] = proj
+    for proj in index.projects:
+        tail = proj.lstrip(":").replace(":", "/")
+        if tail and (repo / tail).is_dir():
+            pairs.setdefault(tail, proj)
+    return sorted(pairs.items(), key=lambda x: (-len(x[0]), x[0]))
+
+
+def _find_test_file_on_disk(repo: Path, test_path: str) -> Path | None:
+    """Resolve a PR test path to an on-disk file (direct path or unique ``**/src/test/java/**``)."""
+    norm = test_path.replace("\\", "/").strip().lstrip("/")
+    direct = repo / norm
+    if direct.is_file():
+        return direct
+    base = Path(norm).name
+    if not base.endswith(".java"):
         return None
-    prefix = p.split("/src/test/", 1)[0].strip("/")
-    if not prefix:
+    hits = sorted(repo.glob(f"**/src/test/java/**/{base}"))
+    hits = [p for p in hits if p.is_file()]
+    if not hits:
         return None
+    if len(hits) == 1:
+        return hits[0]
+    want_suffix = norm.split("src/test/java/", 1)[-1] if "src/test/java/" in norm else ""
+    if want_suffix:
+        suffix_hits = [
+            h
+            for h in hits
+            if h.relative_to(repo).as_posix().endswith("src/test/java/" + want_suffix)
+        ]
+        if len(suffix_hits) == 1:
+            return suffix_hits[0]
+        if suffix_hits:
+            return _pick_best_test_file_hit(suffix_hits, repo, norm)
+    return _pick_best_test_file_hit(hits, repo, norm)
+
+
+def gradle_projects_owning_relative_path(
+    rel_path: str,
+    index: GradleProjectIndex,
+    repo: Path,
+    *,
+    requested_path: str = "",
+) -> list[str]:
+    """Gradle projects whose directory contains ``rel_path`` (best match first)."""
+    rel = rel_path.replace("\\", "/").strip().lstrip("/")
+    owners: list[str] = []
+    for dir_rel, proj in _iter_project_directory_pairs(index, repo):
+        if dir_rel:
+            if rel == dir_rel or rel.startswith(dir_rel + "/"):
+                owners.append(proj)
+        elif rel.startswith("src/test/") or rel.startswith("src/intTest/"):
+            owners.append(proj)
+    if not owners:
+        return []
+    req = requested_path or rel_path
+    ranked = sorted(
+        owners,
+        key=lambda proj: _score_gradle_project_for_test(proj, rel, req),
+        reverse=True,
+    )
+    seen: set[str] = set()
+    out: list[str] = []
+    for proj in ranked:
+        if proj not in seen:
+            seen.add(proj)
+            out.append(proj)
+    return out
+
+
+def resolve_gradle_project_for_test_path(
+    repo: Path,
+    test_path: str,
+    index: GradleProjectIndex,
+) -> str | None:
+    """
+    Pick an unambiguous Gradle project for a Java test file path.
+
+    Prefer filesystem ownership (settings ``include`` / ``projectDir``), then longest
+    matching project name. Never return a short name that Gradle would treat as ambiguous.
+    """
+    norm = test_path.replace("\\", "/").strip()
+    norm_l = norm.lstrip("/")
+    if is_repo_root_java_test_rel(norm_l):
+        return _root_gradle_project(index, repo)
+
+    disk = _find_test_file_on_disk(repo, norm)
+    rel = disk.relative_to(repo).as_posix() if disk is not None else norm_l
+
+    owners = gradle_projects_owning_relative_path(
+        rel, index, repo, requested_path=norm
+    )
+    if owners:
+        return owners[0]
+
+    from .java_build import module_prefix_before_java_test
+
+    prefix = module_prefix_before_java_test(norm)
+    if prefix is None:
+        return None
+    if prefix == "":
+        return _root_gradle_project(index, repo)
+
+    for dir_rel, proj in _iter_project_directory_pairs(index, repo):
+        if prefix == dir_rel or prefix.endswith("/" + dir_rel):
+            return proj
+
+    matches = gradle_projects_matching_short_name(prefix.split("/")[-1], index, repo)
+    if matches:
+        return matches[0]
+
+    return _fallback_map_test_path(norm, index, repo)
+
+
+def _mapping_matches_test_path(
+    path: str,
+    project: str,
+    index: GradleProjectIndex,
+    repo: Path,
+) -> bool:
+    """Reject LLM guesses that do not own the test file path."""
+    proj = _normalize_gradle_project(project)
+    disk = _find_test_file_on_disk(repo, path)
+    if disk is not None:
+        owners = gradle_projects_owning_relative_path(
+            disk.relative_to(repo).as_posix(),
+            index,
+            repo,
+            requested_path=path,
+        )
+        if owners:
+            return proj == owners[0] or proj in owners
+    resolved = resolve_gradle_project_for_test_path(repo, path, index)
+    return resolved is not None and proj == _normalize_gradle_project(resolved)
+
+
+def _fallback_map_test_path(path: str, index: GradleProjectIndex, repo: Path | None = None) -> str | None:
+    from .java_build import module_prefix_before_java_test
+
+    prefix = module_prefix_before_java_test(path)
+    if prefix is None:
+        return None
+    if prefix == "":
+        if repo is not None:
+            return _root_gradle_project(index, repo)
+        return ":"
 
     for dir_rel, proj in index.dir_to_project:
         d = dir_rel.strip("/")
@@ -133,6 +622,14 @@ def _fallback_map_test_path(path: str, index: GradleProjectIndex) -> str | None:
     for proj in index.projects:
         tail = proj.lstrip(":").split(":")[-1]
         name_to_proj[tail] = proj
+
+    if repo is not None:
+        for cand in reversed(candidates):
+            if not cand:
+                continue
+            matches = gradle_projects_matching_short_name(cand, index, repo)
+            if matches:
+                return matches[0]
 
     for cand in candidates:
         if not cand:
@@ -167,9 +664,11 @@ def _parse_llm_mappings(raw: str, test_paths: list[str]) -> dict[str, str]:
 
 
 def _apply_coerced_mappings(
-    raw: dict[str, str], index: GradleProjectIndex
+    raw: dict[str, str],
+    index: GradleProjectIndex,
+    repo: Path | None = None,
 ) -> dict[str, str]:
-    return {tp: coerce_gradle_project(gp, index) for tp, gp in raw.items()}
+    return {tp: coerce_gradle_project(gp, index, repo) for tp, gp in raw.items()}
 
 
 def llm_resolve_gradle_projects_for_test_paths(
@@ -231,9 +730,9 @@ def resolve_gradle_projects_for_test_paths(
     out: dict[str, str] = {}
 
     for p in paths:
-        fb = _fallback_map_test_path(p, index)
-        if fb:
-            out[p] = coerce_gradle_project(fb, index)
+        resolved = resolve_gradle_project_for_test_path(repo, p, index)
+        if resolved:
+            out[p] = coerce_gradle_project(resolved, index, repo)
 
     unresolved = [p for p in paths if p not in out]
     if api_key and api_key.strip() and unresolved:
@@ -248,8 +747,15 @@ def resolve_gradle_projects_for_test_paths(
                 timeout_s=timeout_s,
                 repo_id=repo_id,
             )
-            for tp, gp in _apply_coerced_mappings(llm_out, index).items():
-                out[tp] = gp
+            for tp, gp in _apply_coerced_mappings(llm_out, index, repo).items():
+                if _mapping_matches_test_path(tp, gp, index, repo):
+                    out[tp] = gp
+                elif instance_id:
+                    print(
+                        f"  {instance_id}: reject Gradle map {gp} for {tp.split('/')[-1]} "
+                        f"(path/module mismatch)",
+                        file=sys.stderr,
+                    )
         except Exception as ex:
             if instance_id:
                 print(
@@ -260,9 +766,9 @@ def resolve_gradle_projects_for_test_paths(
     for p in paths:
         if p in out:
             continue
-        fb = _fallback_map_test_path(p, index)
-        if fb:
-            out[p] = coerce_gradle_project(fb, index)
+        resolved = resolve_gradle_project_for_test_path(repo, p, index)
+        if resolved:
+            out[p] = coerce_gradle_project(resolved, index, repo)
 
     if instance_id:
         for p in paths[:8]:

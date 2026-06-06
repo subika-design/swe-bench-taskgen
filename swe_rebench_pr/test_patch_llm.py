@@ -305,6 +305,8 @@ def remediate_test_patch_until_applies(
     instance_id: str = "",
     test_paths: list[str] | None = None,
     java_harness_context: str = "",
+    base_commit: str = "",
+    head_sha: str = "",
 ) -> tuple[str, bool, str]:
     """
     Validate with ``git apply --check``; LLM-fix until valid or max attempts.
@@ -315,6 +317,25 @@ def remediate_test_patch_until_applies(
     last_err = ""
     prev = current
     cap = max(1, max_attempts)
+
+    paths = [p for p in (test_paths or []) if p.strip()]
+    if paths and base_commit.strip() and head_sha.strip():
+        from .patch_validate import recover_test_patch_paths_from_git
+
+        recovered = recover_test_patch_paths_from_git(
+            repo, base_commit, head_sha, paths
+        )
+        if recovered:
+            ok_rec, _ = validate_git_patch(recovered, repo)
+            if ok_rec:
+                if instance_id:
+                    print(
+                        f"  {instance_id}: test_patch recovered from git diff "
+                        f"{base_commit[:12]}..{head_sha[:12]} per-file",
+                        file=sys.stderr,
+                    )
+                return recovered, True, ""
+            current = recovered
 
     for attempt in range(1, cap + 1):
         ok, err = validate_git_patch(current, repo)

@@ -320,6 +320,30 @@ def test_cmake_native_prepare_targets(tmp_path: Path):
     from swe_rebench_pr.integration_build import cmake_native_prepare_targets
 
     assert "testdeps" in cmake_native_prepare_targets(tmp_path)
+    assert "testdeps" not in cmake_native_prepare_targets(
+        tmp_path, include_libtest_targets=False
+    )
+
+
+def test_native_integration_setup_skips_testdeps_without_libtest(tmp_path: Path):
+    tests = tmp_path / "tests" / "http"
+    tests.mkdir(parents=True)
+    (tests / "conftest.py").write_text("# pytest\n", encoding="utf-8")
+    (tmp_path / "tests" / "CMakeLists.txt").write_text(
+        "add_custom_target(testdeps)\nadd_custom_target(build-certs)\n",
+        encoding="utf-8",
+    )
+    from swe_rebench_pr.integration_build import native_integration_setup_lines
+
+    http_only = (
+        "diff --git a/tests/http/test_60_h3_proxy.py b/tests/http/test_60_h3_proxy.py\n"
+    )
+    setup = native_integration_setup_lines(
+        tmp_path, "tests/http", test_patch=http_only
+    )
+    joined = "\n".join(setup)
+    assert "build-certs" in joined
+    assert "testdeps" not in joined
 
 
 def test_ci_pytest_run_lines(tmp_path: Path):
@@ -404,17 +428,13 @@ def test_native_build_install_config_http3_cmake_and_h2o(tmp_path: Path):
         test_paths=["tests/http/test_60_h3_proxy.py"],
     )
     install = str(cfg.get("install") or "")
-    assert "USE_NGTCP2" in install.upper()
-    assert "Ninja" in install or "ninja" in install.lower()
+    assert "USE_NGTCP2" not in install.upper()
+    assert "CMAKE_BUILD_TYPE=Release" in install
+    assert not any("ngtcp2" in p for p in cfg.get("apt-pkgs") or [])
     pre = " ".join(cfg.get("pre_install") or [])
-    assert "h2o" in pre
-    assert "libngtcp2-crypto-gnutls-dev" in pre
-    assert "bookworm-backports" not in pre
-    assert "libngtcp2-crypto-ossl-dev" not in (cfg.get("apt-pkgs") or [])
+    assert "h2o" not in pre
+    assert "libngtcp2-crypto-gnutls-dev" not in pre
     assert cfg.get("language") == "c"
-    if not cmake_definitions_from_ci_for_http3_pytest(tmp_path):
-        for flag in DEFAULT_NATIVE_HTTP3_CMAKE_DEFINITIONS:
-            assert flag in install
 
 
 def test_native_http3_pre_install_no_backports():
@@ -422,6 +442,54 @@ def test_native_http3_pre_install_no_backports():
     assert "bookworm-backports" not in pre
     assert "libngtcp2-crypto-gnutls-dev" in pre
     assert "libngtcp2-crypto-ossl-dev" in pre
+
+
+def test_remediate_quictls_native_integration_minimal_cmake(tmp_path: Path):
+    from swe_rebench_pr.integration_build import remediate_quictls_native_integration
+
+    (tmp_path / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n", encoding="utf-8")
+    cfg = {
+        "native_integration_build": True,
+        "install": (
+            "mkdir -p build && cd build && cmake -G Ninja .. "
+            "-DENABLE_DEBUG=ON -DUSE_NGTCP2=ON"
+        ),
+        "apt-pkgs": ["libngtcp2-dev", "libnghttp3-dev"],
+        "pre_install": ["apt-get install -y h2o libngtcp2-crypto-gnutls-dev"],
+    }
+    out = remediate_quictls_native_integration(cfg, tmp_path)
+    assert "rm -rf build" in out["install"]
+    assert "USE_NGTCP2" not in out["install"].upper()
+    assert "ENABLE_DEBUG" not in out["install"]
+    assert not any("ngtcp2" in p for p in out.get("apt-pkgs") or [])
+    assert not any("h2o" in ln for ln in out.get("pre_install") or [])
+
+
+def test_remediate_native_integration_ngtcp2_strips_flags(tmp_path: Path):
+    from swe_rebench_pr.integration_build import (
+        native_integration_http3_disabled,
+        remediate_native_integration_ngtcp2,
+    )
+
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.20)\nfind_package(NGHTTP2 REQUIRED)\n",
+        encoding="utf-8",
+    )
+    cfg = {
+        "install": (
+            "mkdir -p build && cd build && cmake -G Ninja .. "
+            "-DUSE_NGTCP2=ON -DCURL_USE_OPENSSL=ON"
+        ),
+        "apt-pkgs": ["libngtcp2-dev", "libnghttp3-dev", "cmake"],
+        "pre_install": ["apt-get install -y libngtcp2-crypto-gnutls-dev"],
+    }
+    out = remediate_native_integration_ngtcp2(cfg, tmp_path)
+    assert "USE_NGTCP2" not in out["install"].upper()
+    assert "rm -rf build" in out["install"]
+    assert not any("ngtcp2" in p for p in out.get("apt-pkgs") or [])
+    assert native_integration_http3_disabled(out)
+    assert "libnghttp2-dev" in (out.get("apt-pkgs") or [])
+    assert not out.get("native_integration_build")
 
 
 def test_repo_wants_http3_from_cmake_and_test_paths(tmp_path: Path):
@@ -437,7 +505,9 @@ def test_repo_wants_http3_from_cmake_and_test_paths(tmp_path: Path):
         "cmake_minimum_required(VERSION 3.20)\nset(USE_NGTCP2 ON)\n",
         encoding="utf-8",
     )
-    assert repo_wants_http3_pytest_cmake(tmp_path, ["tests/unit/test_plain.py"])
+    assert not repo_wants_http3_pytest_cmake(tmp_path, ["tests/unit/test_plain.py"])
+    assert not repo_wants_http3_pytest_cmake(tmp_path, [])
+    assert repo_wants_http3_pytest_cmake(tmp_path, None)
 
 
 def test_merge_pre_install_handles_update_and_install_line():
@@ -468,7 +538,7 @@ def test_http3_native_build_strips_redundant_c_apt_preinstall(tmp_path: Path):
         test_paths=["tests/http/test_60_h3_proxy.py"],
     )
     pre = cfg.get("pre_install") or []
-    assert any("libnghttp3-dev" in ln for ln in pre)
+    assert not any("libnghttp3-dev" in ln for ln in pre)
     assert not any(
         ln.strip() == "apt-get update -qq"
         or (

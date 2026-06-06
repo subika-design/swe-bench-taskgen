@@ -1,9 +1,19 @@
 from swe_rebench_pr.task_type import (
     TASK_TYPE_PARTIALLY_VALID,
+    TASK_TYPE_SKIP,
     TASK_TYPE_VALID,
     classify_task_type,
+    is_gradable_task_type,
     task_type_skip_reason,
 )
+
+
+def test_is_gradable_task_type():
+    assert is_gradable_task_type(TASK_TYPE_VALID)
+    assert is_gradable_task_type(TASK_TYPE_PARTIALLY_VALID)
+    assert not is_gradable_task_type(TASK_TYPE_SKIP)
+    assert not is_gradable_task_type("")
+    assert not is_gradable_task_type("bogus")
 
 
 def test_valid_when_f2p_and_zero_failures():

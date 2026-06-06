@@ -3,6 +3,7 @@ from swe_rebench_pr.harness.constants import (
     MAP_REPO_VERSION_TO_SPECS,
     START_TEST_OUTPUT,
 )
+from swe_rebench_pr.harness.git_clone_cmds import git_fetch_and_reset_commands
 from swe_rebench_pr.harness.utils import get_modified_files
 
 
@@ -45,7 +46,7 @@ def make_repo_script_list_common(
         f"git clone -o origin https://github.com/{repo} {repo_directory}",
         f"chmod -R 777 {repo_directory}",  # So nonroot user can run tests
         f"cd {repo_directory}",
-        f"git reset --hard {base_commit}",
+        *git_fetch_and_reset_commands(base_commit),
         "git remote remove origin",  # Remove the remote so the agent won't see newer commits
     ]
     if "pre_install" in specs:

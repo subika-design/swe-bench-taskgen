@@ -104,9 +104,16 @@ def preflight_pr(
     else:
         lang = normalize_language(lang)
 
+    from .patch_paths import collect_gradable_test_paths_from_patch
+
+    gradable_paths = collect_gradable_test_paths_from_patch(test_patch, lang)
     test_paths = collect_test_targets_from_test_patch(lang, test_patch)
-    if require_test_paths_in_diff and not test_paths and not allow_llm_test_patch:
-        blockers.append("No test file paths in PR diff (test_patch empty)")
+    if require_test_paths_in_diff and not gradable_paths and not allow_llm_test_patch:
+        blockers.append("No gradable test file paths in PR diff (test_patch empty)")
+    if lang in ("python", "py") and test_patch.strip() and not gradable_paths:
+        blockers.append(
+            "test_patch has no Python test modules (test_*.py / *_test.py)"
+        )
 
     # Scan diff + a few root files for hard markers
     marker_hits = _scan_text_for_hard_markers(diff)

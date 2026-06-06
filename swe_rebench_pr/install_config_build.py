@@ -84,21 +84,37 @@ def build_install_config_for_repo(
         from .js_build import merge_js_build_into_config
 
         cfg = merge_js_build_into_config(cfg, repo, test_paths)
-    elif lang == "c" and repo is not None:
-        from .integration_build import (
-            apply_native_build_if_integration,
-            merge_hybrid_c_integration_paths,
-        )
+    elif lang == "python":
+        from .python_build import finalize_python_install_config, merge_python_build_into_config
 
-        detection, _runner = merge_hybrid_c_integration_paths(
-            patch, test_patch, language=language, test_paths=test_paths
-        )
-        cfg = apply_native_build_if_integration(
+        if test_paths:
+            cfg = merge_python_build_into_config(
+                cfg, repo, test_paths, repo_id=repo_id
+            )
+        else:
+            cfg = finalize_python_install_config(cfg, repo, repo_id=repo_id)
+    elif lang == "go":
+        from .go_build import go_install_config_for_repo, merge_go_build_into_config
+
+        if test_paths:
+            cfg = merge_go_build_into_config(cfg, repo, test_paths)
+        else:
+            cfg = go_install_config_for_repo(repo, base=cfg)
+    elif lang == "php" and repo is not None:
+        from .ci_extract import ci_all_run_lines
+        from .php_build import apply_self_hosting_composer_install, php_install_config_for_repo
+
+        cfg = php_install_config_for_repo(repo, base=cfg)
+        cfg = apply_self_hosting_composer_install(cfg, repo, ci_runs=ci_all_run_lines(repo))
+    elif lang == "c" and repo is not None:
+        from .c_harness_router import apply_c_harness_router
+
+        cfg = apply_c_harness_router(
             cfg,
             repo,
-            test_paths=detection,
-            test_patch=test_patch,
             patch=patch,
+            test_patch=test_patch,
+            test_paths=test_paths,
         )
 
     if llm_install is not None:

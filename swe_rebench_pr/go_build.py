@@ -215,3 +215,44 @@ def ensure_go_docker_specs(
         specs["go_version"] = gv or DEFAULT_GO_VERSION
     out["docker_specs"] = specs
     return out
+
+
+def go_install_config_for_repo(
+    repo: Path,
+    *,
+    base: dict[str, Any] | None = None,
+    test_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Heuristic ``install_config`` for Go repos from ``go.mod`` and test paths."""
+    from .languages import get_language_spec
+
+    cfg = dict(base or get_language_spec("go").default_install_config)
+    cfg["language"] = "go"
+    cfg = ensure_go_docker_specs(cfg, repo=repo, language="go")
+    cfg["install"] = "go mod download"
+    paths = list(test_paths or [])
+    cfg["test_cmd"] = resolve_go_test_invocation(str(cfg.get("test_cmd") or ""), paths)
+    return cfg
+
+
+def merge_go_build_into_config(
+    cfg: dict[str, Any],
+    repo: Path,
+    test_paths: list[str],
+) -> dict[str, Any]:
+    """Apply Go heuristics before Docker discover / image build."""
+    from .ci_fidelity import should_preserve_ci_test_cmd
+
+    tc_in = str(cfg.get("test_cmd") or "").strip()
+    base = go_install_config_for_repo(repo, base=cfg, test_paths=test_paths)
+    out = dict(cfg)
+    if should_preserve_ci_test_cmd(out) and re.search(r"-run\b", tc_in):
+        out = ensure_go_docker_specs(out, repo=repo, language="go")
+        if not str(out.get("install") or "").strip():
+            out["install"] = base.get("install")
+    else:
+        for key in ("install", "test_cmd", "docker_specs"):
+            if base.get(key):
+                out[key] = base[key]
+    out["language"] = "go"
+    return out

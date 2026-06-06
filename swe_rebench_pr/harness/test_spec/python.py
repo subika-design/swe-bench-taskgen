@@ -15,6 +15,12 @@ from swe_rebench_pr.harness.constants import (
     END_TEST_OUTPUT,
     REPO_BASE_COMMIT_BRANCH,
 )
+from swe_rebench_pr.harness.git_clone_cmds import (
+    git_clone_branch_arg,
+    git_fetch_and_reset_commands,
+    git_post_reset_hygiene_commands,
+    python_conda_activate_commands,
+)
 from swe_rebench_pr.harness.utils import get_modified_files, get_new_files, load_cached_environment_yml
 from functools import cache
 
@@ -268,28 +274,14 @@ def make_repo_script_list_py(
     Create a list of bash commands to set up the repository for testing.
     This is the setup script for the instance image.
     """
-    branch = REPO_BASE_COMMIT_BRANCH.get(repo, {}).get(base_commit, "")
-    branch = f"--branch {branch}" if branch else ""
+    branch = git_clone_branch_arg(repo, base_commit)
     setup_commands = [
         f"git clone -o origin {branch} --single-branch https://github.com/{repo} {repo_directory}",
         f"chmod -R 777 {repo_directory}",  # So nonroot user can run tests
         f"cd {repo_directory}",
-        f"git reset --hard {base_commit}",
-        # Remove the remote and tags so the agent won't see newer commits.
-        "git remote remove origin",
-        # Remove only tags pointing to commits after target timestamp
-        f"TARGET_TIMESTAMP=$(git show -s --format=%ci {base_commit})",
-        'git tag -l | while read tag; do TAG_COMMIT=$(git rev-list -n 1 "$tag"); TAG_TIME=$(git show -s --format=%ci "$TAG_COMMIT"); if [[ "$TAG_TIME" > "$TARGET_TIMESTAMP" ]]; then git tag -d "$tag"; fi; done',
-        "git reflog expire --expire=now --all",
-        "git gc --prune=now --aggressive",
-        # Verify future logs aren't available
-        "AFTER_TIMESTAMP=$(date -d \"$TARGET_TIMESTAMP + 1 second\" '+%Y-%m-%d %H:%M:%S')",
-        'COMMIT_COUNT=$(git log --oneline --all --since="$AFTER_TIMESTAMP" | wc -l)',
-        '[ "$COMMIT_COUNT" -eq 0 ] || exit 1',
-        # Make sure conda is available for later use
-        "source /opt/miniconda3/bin/activate",
-        f"conda activate {env_name}",
-        'echo "Current environment: $CONDA_DEFAULT_ENV"',
+        *git_fetch_and_reset_commands(base_commit),
+        *git_post_reset_hygiene_commands(base_commit),
+        *python_conda_activate_commands(env_name),
     ]
     if repo in MAP_REPO_TO_INSTALL:
         setup_commands.append(MAP_REPO_TO_INSTALL[repo])

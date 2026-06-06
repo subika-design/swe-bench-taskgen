@@ -40,6 +40,22 @@ _SETUP_RUBY_RE = re.compile(
     r"ruby-version:\s*['\"]?([^'\"\n${}]+)",
     re.IGNORECASE,
 )
+_SETUP_PHP_EXTENSIONS_RE = re.compile(
+    r"extensions:\s*['\"]?([^'\"\n${}]+)",
+    re.IGNORECASE,
+)
+_SETUP_PHP_INI_RE = re.compile(
+    r"ini-values:\s*['\"]?([^'\"\n${}]+)",
+    re.IGNORECASE,
+)
+_SETUP_PHP_TOOLS_RE = re.compile(
+    r"tools:\s*['\"]?([^'\"\n${}]+)",
+    re.IGNORECASE,
+)
+_GITHUB_ENV_COMPOSER_FLAGS_RE = re.compile(
+    r"COMPOSER_FLAGS:\s*['\"]?([^'\"\n${}]+)",
+    re.IGNORECASE,
+)
 
 _FROM_IMAGE_RE = re.compile(
     r"^\s*FROM\s+(?:--\S+\s+)*([^\s:]+(?::[^\s@]+)?)",
@@ -56,6 +72,20 @@ _INSTALL_SCORES: tuple[tuple[re.Pattern[str], int], ...] = (
     (re.compile(r"\bgo\s+mod\s+download\b", re.I), 11),
     (re.compile(r"\bcargo\s+build\b", re.I), 10),
     (re.compile(r"\bpip\s+install\b", re.I), 10),
+    (re.compile(r"\bpip\s+install\s+-e\s+[\"']?\.\[", re.I), 12),
+    (re.compile(r"\bpdm\s+install\b", re.I), 11),
+    (re.compile(r"\bpdm\s+sync\b", re.I), 11),
+    (re.compile(r"\buv\s+pip\s+install\b", re.I), 12),
+    (re.compile(r"\buv\s+sync\b", re.I), 11),
+    (re.compile(r"\bpoetry\s+install\b", re.I), 11),
+    (re.compile(r"\bpnpm\s+install\b", re.I), 11),
+    (re.compile(r"\bbun\s+install\b", re.I), 10),
+    (re.compile(r"\btox\s+-e\b", re.I), 11),
+    (re.compile(r"\bnox\s+-", re.I), 11),
+    (re.compile(r"\bhatch\s+run\b", re.I), 10),
+    (re.compile(r"\bmake\s+test\b", re.I), 9),
+    (re.compile(r"\byarn\s+workspaces\b", re.I), 10),
+    (re.compile(r"\blerna\s+bootstrap\b", re.I), 9),
     (re.compile(r"\bmvn\s+.*(?:package|compile)\b", re.I), 10),
     (re.compile(r"\bgradlew\b.*(?:assemble|compile|build)", re.I), 10),
     (re.compile(r"\bcmake\b", re.I), 8),
@@ -65,6 +95,7 @@ _INSTALL_SCORES: tuple[tuple[re.Pattern[str], int], ...] = (
 _TEST_SCORES: tuple[tuple[re.Pattern[str], int], ...] = (
     (re.compile(r"\bpytest\b", re.I), 12),
     (re.compile(r"\bvendor/bin/phpunit\b", re.I), 12),
+    (re.compile(r"\bvendor/bin/simple-phpunit\b", re.I), 12),
     (re.compile(r"\bvendor/bin/pest\b", re.I), 12),
     (re.compile(r"\bphp\s+artisan\s+test\b", re.I), 11),
     (re.compile(r"\bbundle\s+exec\s+rspec\b", re.I), 12),
@@ -76,6 +107,7 @@ _TEST_SCORES: tuple[tuple[re.Pattern[str], int], ...] = (
     (re.compile(r"\bnpx\s+jest\b", re.I), 11),
     (re.compile(r"\bnpx\s+vitest\b", re.I), 11),
     (re.compile(r"\bnpm\s+test\b", re.I), 9),
+    (re.compile(r"\bpnpm\s+(run\s+)?test\b", re.I), 10),
     (re.compile(r"\byarn\s+test\b", re.I), 9),
     (re.compile(r"\bgradlew\b.*\btest\b", re.I), 11),
     (re.compile(r"\bmvn\s+.*\btest\b", re.I), 10),
@@ -102,22 +134,33 @@ class CiExtractDraft:
     """Structured signals from CI/Docker — merged into ``install_config``."""
 
     install: str | None = None
+    install_steps: list[str] = field(default_factory=list)
     test_cmd: str | None = None
     pre_install: list[str] = field(default_factory=list)
+    post_install: list[str] = field(default_factory=list)
+    eval_commands: list[str] = field(default_factory=list)
     apt_pkgs: list[str] = field(default_factory=list)
     docker_specs: dict[str, str] = field(default_factory=dict)
     python: str | None = None
     test_env: dict[str, str] = field(default_factory=dict)
+    php_extensions: list[str] = field(default_factory=list)
+    php_tools: list[str] = field(default_factory=list)
     ci_excerpt: str = ""
 
     def as_merge_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
         if self.install:
             out["install"] = self.install
+        if self.install_steps:
+            out["install_steps"] = list(self.install_steps)
         if self.test_cmd:
             out["test_cmd"] = self.test_cmd
         if self.pre_install:
             out["pre_install"] = list(self.pre_install)
+        if self.post_install:
+            out["post_install"] = list(self.post_install)
+        if self.eval_commands:
+            out["eval_commands"] = list(self.eval_commands)
         if self.apt_pkgs:
             out["apt-pkgs"] = list(self.apt_pkgs)
         if self.docker_specs:
@@ -126,6 +169,10 @@ class CiExtractDraft:
             out["python"] = self.python
         if self.test_env:
             out["test_env"] = dict(self.test_env)
+        if self.php_extensions:
+            out["php_extensions"] = list(self.php_extensions)
+        if self.php_tools:
+            out["php_tools"] = list(self.php_tools)
         if self.ci_excerpt:
             out["_ci_excerpt"] = self.ci_excerpt
         return out
@@ -240,6 +287,67 @@ def _pick_best_line(candidates: list[str], patterns: tuple[tuple[re.Pattern[str]
         if best is None or sc > best[0]:
             best = (sc, line)
     return best[1] if best else None
+
+
+def _pick_install_sequence(
+    candidates: list[str],
+    patterns: tuple[tuple[re.Pattern[str], int], ...],
+    *,
+    min_score: int = 5,
+) -> list[str]:
+    """Ordered install/build ``run:`` lines from CI (first-seen order, deduped)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in candidates:
+        if _score_line(line, patterns) < min_score:
+            continue
+        if line in seen:
+            continue
+        seen.add(line)
+        out.append(line)
+    return out
+
+
+def _parse_setup_php(text: str) -> dict[str, Any]:
+    """Signals from ``shivammathur/setup-php`` action blocks."""
+    out: dict[str, Any] = {}
+    m = _SETUP_PHP_EXTENSIONS_RE.search(text)
+    if m:
+        raw = m.group(1).strip().strip("'\"")
+        if raw and not raw.startswith("${{"):
+            out["php_extensions"] = [e.strip().lower() for e in raw.split(",") if e.strip()]
+    m = _SETUP_PHP_INI_RE.search(text)
+    if m:
+        raw = m.group(1).strip().strip("'\"")
+        if raw and not raw.startswith("${{"):
+            out["php_ini_values"] = raw
+    m = _SETUP_PHP_TOOLS_RE.search(text)
+    if m:
+        raw = m.group(1).strip().strip("'\"")
+        if raw and not raw.startswith("${{"):
+            out["php_tools"] = [t.strip() for t in raw.split(",") if t.strip()]
+    return out
+
+
+def _php_ini_to_eval_commands(ini_values: str) -> list[str]:
+    """Map setup-php ``ini-values`` to shell exports for Docker replay."""
+    cmds: list[str] = []
+    for part in ini_values.split(","):
+        kv = part.strip()
+        if not kv or "=" not in kv:
+            continue
+        key, val = kv.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if not key:
+            continue
+        cmds.append(f'export PHP_INI_{key.upper().replace(".", "_")}={val!r}')
+        if key == "phar.readonly" and val == "0":
+            cmds.append("export PHP_INI_SCAN_DIR=/usr/local/etc/php/conf.d")
+            cmds.append(
+                'echo "phar.readonly=0" > /usr/local/etc/php/conf.d/99-swe-rebench.ini 2>/dev/null || true'
+            )
+    return cmds
 
 
 def _parse_setup_versions(text: str) -> dict[str, str]:
@@ -358,10 +466,28 @@ def extract_ci_draft(repo: Path, *, max_workflow_files: int = 40) -> CiExtractDr
             val = m.group(2) or m.group(3) or m.group(4) or ""
             if val and not val.startswith("${{"):
                 draft.test_env[m.group(1)] = val
+        m = _GITHUB_ENV_COMPOSER_FLAGS_RE.search(text)
+        if m:
+            val = m.group(1).strip().strip("'\"")
+            if val and not val.startswith("${{"):
+                draft.test_env.setdefault("COMPOSER_FLAGS", val)
+        php_setup = _parse_setup_php(text)
+        for ext in php_setup.get("php_extensions") or []:
+            if ext not in draft.php_extensions:
+                draft.php_extensions.append(ext)
+        for tool in php_setup.get("php_tools") or []:
+            if tool not in draft.php_tools:
+                draft.php_tools.append(tool)
+        ini_vals = php_setup.get("php_ini_values")
+        if isinstance(ini_vals, str) and ini_vals.strip():
+            for cmd in _php_ini_to_eval_commands(ini_vals):
+                if cmd not in draft.eval_commands:
+                    draft.eval_commands.append(cmd)
 
     draft.apt_pkgs = list(apt_packages_from_ci_workflows(repo, max_files=max_workflow_files))
 
     if all_runs:
+        draft.install_steps = _pick_install_sequence(all_runs, _INSTALL_SCORES)
         inst = _pick_best_line(all_runs, _INSTALL_SCORES)
         if inst:
             draft.install = inst
@@ -515,23 +641,41 @@ def merge_ci_draft_into_config(
     defaults = spec.default_install_config
     out = dict(cfg)
 
-    def _is_default(val: str | None, default_val: str | None) -> bool:
-        if not val or not default_val:
-            return not bool(val)
-        return val.strip() == str(default_val).strip()
+    from .ci_fidelity import mark_ci_test_cmd_trusted, should_merge_ci_install, should_merge_ci_test_cmd
 
     ci_install = overlay.get("install")
-    if ci_install and _is_default(str(out.get("install") or ""), str(defaults.get("install") or "")):
-        out["install"] = str(ci_install)
+    install_steps = overlay.get("install_steps")
+    composed_install: str | None = None
+    if isinstance(install_steps, list) and install_steps:
+        from .ci_install_normalize import compose_ci_install_sequence
+
+        composed_install = compose_ci_install_sequence(
+            [str(x) for x in install_steps if str(x).strip()],
+            language=language,
+        )
+    if composed_install and should_merge_ci_install(
+        out, composed_install, defaults, language=language, overlay=overlay
+    ):
+        out["install"] = composed_install
+        out["_ci_install_trusted"] = True
+    elif ci_install and should_merge_ci_install(
+        out, str(ci_install), defaults, language=language, overlay=overlay
+    ):
+        from .ci_install_normalize import normalize_ci_install_command
+
+        out["install"] = normalize_ci_install_command(str(ci_install), language=language)
+        out["_ci_install_trusted"] = True
 
     ci_test = overlay.get("test_cmd")
-    if ci_test and _is_default(str(out.get("test_cmd") or ""), str(defaults.get("test_cmd") or "")):
-        out["test_cmd"] = str(ci_test)
-    elif ci_test and not str(out.get("test_cmd") or "").strip():
-        out["test_cmd"] = str(ci_test)
+    if ci_test and should_merge_ci_test_cmd(out, str(ci_test), defaults, overlay=overlay):
+        from .ci_install_normalize import normalize_ci_test_command
+
+        out["test_cmd"] = normalize_ci_test_command(str(ci_test), language=language)
+        out = mark_ci_test_cmd_trusted(out)
 
     if overlay.get("python") and language == "python":
-        if not out.get("python") or str(out.get("python")) in ("3.10", "3.11"):
+        py = str(out.get("python") or "").strip()
+        if not py or py in ("3.10", "3.11"):
             out["python"] = str(overlay["python"]).split("-")[0]
 
     specs = dict(out.get("docker_specs") or {}) if isinstance(out.get("docker_specs"), dict) else {}
@@ -557,6 +701,34 @@ def merge_ci_draft_into_config(
                 pre.append(ln.strip())
         out["pre_install"] = pre
 
+    ci_post = overlay.get("post_install")
+    if isinstance(ci_post, list) and ci_post:
+        post = list(out.get("post_install") or [])
+        for ln in ci_post:
+            if isinstance(ln, str) and ln.strip() and ln not in post:
+                post.append(ln.strip())
+        out["post_install"] = post
+
+    ci_eval = overlay.get("eval_commands")
+    if isinstance(ci_eval, list) and ci_eval:
+        ev = list(out.get("eval_commands") or [])
+        for ln in ci_eval:
+            if isinstance(ln, str) and ln.strip() and ln not in ev:
+                ev.append(ln.strip())
+        out["eval_commands"] = ev
+
+    if language == "php" and (
+        overlay.get("php_extensions") or overlay.get("php_tools") or overlay.get("test_env")
+    ):
+        from .php_build import merge_php_ci_signals_into_config
+
+        out = merge_php_ci_signals_into_config(
+            out,
+            php_extensions=list(overlay.get("php_extensions") or []),
+            php_tools=list(overlay.get("php_tools") or []),
+            test_env=dict(overlay.get("test_env") or {}),
+        )
+
     ci_env = overlay.get("test_env")
     if isinstance(ci_env, dict) and ci_env:
         env = dict(out.get("test_env") or {})
@@ -565,5 +737,16 @@ def merge_ci_draft_into_config(
 
     if overlay.get("_ci_excerpt"):
         out["_ci_excerpt"] = str(overlay["_ci_excerpt"])
+
+    inst = str(out.get("install") or "").strip()
+    if inst:
+        from .ci_install_normalize import normalize_ci_install_command
+
+        out["install"] = normalize_ci_install_command(inst, language=language)
+    tc = str(out.get("test_cmd") or "").strip()
+    if tc:
+        from .ci_install_normalize import normalize_ci_test_command
+
+        out["test_cmd"] = normalize_ci_test_command(tc, language=language)
 
     return out

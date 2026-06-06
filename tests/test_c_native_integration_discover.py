@@ -6,10 +6,12 @@ from swe_rebench_pr.builder import resolve_task_language
 from swe_rebench_pr.integration_build import (
     apply_native_build_if_integration,
     discover_harness_language,
+    filter_integration_pytest_modules,
     integration_pytest_paths_from_patches,
     merge_hybrid_c_integration_paths,
     native_integration_discover_active,
     resolve_integration_task_language,
+    patch_diff_touches_libtest,
 )
 
 
@@ -65,6 +67,45 @@ def test_merge_hybrid_c_prefers_pytest_runner_paths():
     assert "tests/http/test_05_01.py" in runner
     assert "tests/http/test_05_02.py" in runner
     assert runner == detection or set(runner).issubset(set(detection))
+
+
+def test_libtest_patch_does_not_activate_native_integration(tmp_path: Path):
+    repo = _cmake_pytest_repo(tmp_path)
+    test_patch = (
+        "diff --git a/tests/libtest/lib1677.c b/tests/libtest/lib1677.c\n"
+        "diff --git a/tests/data/test1677 b/tests/data/test1677\n"
+    )
+    impl = "diff --git a/include/curl/curl.h b/include/curl/curl.h\n"
+    detection, runner = merge_hybrid_c_integration_paths(impl, test_patch)
+    assert runner == []
+    assert "tests/libtest/lib1677.c" in detection
+    cfg = apply_native_build_if_integration(
+        {"language": "c", "install": "true"},
+        repo,
+        test_patch=test_patch,
+        patch=impl,
+    )
+    assert not native_integration_discover_active(cfg)
+    assert resolve_integration_task_language(repo, test_patch=test_patch) is None
+
+
+def test_filter_integration_pytest_modules_drops_non_py():
+    paths = filter_integration_pytest_modules(
+        [
+            "tests/http/test_05_01.py",
+            "tests/libtest/lib1677.c",
+            "tests/data/test1677",
+        ]
+    )
+    assert paths == ["tests/http/test_05_01.py"]
+
+
+def test_patch_diff_touches_libtest():
+    tp = "diff --git a/tests/libtest/lib1677.c b/tests/libtest/lib1677.c\n"
+    assert patch_diff_touches_libtest(tp)
+    assert not patch_diff_touches_libtest(
+        "diff --git a/tests/http/test_60_h3_proxy.py b/tests/http/test_60_h3_proxy.py\n"
+    )
 
 
 def test_apply_native_build_when_only_pytest_in_test_patch(tmp_path: Path):

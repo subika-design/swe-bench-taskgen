@@ -29,6 +29,20 @@ def test_apt_packages_from_chocolate_doom_sdl_log():
     assert "libsdl2-net-dev" in pkgs
 
 
+def test_remediate_c_install_strips_ngtcp2_when_quictls_missing(tmp_path: Path):
+    (tmp_path / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n", encoding="utf-8")
+    cfg = {
+        "language": "c",
+        "install": "cmake .. -DUSE_NGTCP2=ON -DUSE_PROXY_HTTP3=ON -DCMAKE_BUILD_TYPE=Release",
+    }
+    log = "Could NOT find libngtcp2_crypto_quictls (missing: libngtcp2_crypto_quictls)"
+    out = remediate_c_install_from_log(
+        cfg, log, repo=tmp_path, test_paths=["tests/unit/test_foo.py"]
+    )
+    assert "USE_NGTCP2" not in out["install"].upper()
+    assert "USE_PROXY_HTTP3" not in out["install"].upper()
+
+
 def test_remediate_c_install_from_log_merges_pre_install():
     cfg = {"language": "c", "install": "mkdir -p build && cd build && cmake .. && cmake --build ."}
     log = "fatal error: uuid/uuid.h: No such file or directory"

@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from swe_rebench_pr.gh_pr import ParsedPR, strip_mailbox_to_unified
 from swe_rebench_pr.patch_validate import (
+    PatchSplitUnrecoverableError,
     ensure_valid_patch_split,
     recover_patches_heuristic,
     validate_git_patch,
@@ -63,6 +64,24 @@ def test_recover_patches_heuristic_php_ffmpeg_855(tmp_path: Path):
     ok_test, _ = validate_git_patch(strip_mailbox_to_unified(test), repo)
     ok_impl, _ = validate_git_patch(strip_mailbox_to_unified(impl), repo)
     assert ok_test and ok_impl
+
+
+def test_ensure_valid_patch_split_raises_without_head_sha(tmp_path: Path):
+    repo = _clone_php_ffmpeg_at_base(tmp_path)
+    pr = ParsedPR("PHP-FFMpeg", "PHP-FFMpeg", 855)
+    corrupt_test = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n+b\n"
+    try:
+        ensure_valid_patch_split(
+            pr,
+            repo,
+            "",
+            patch="",
+            test_patch=corrupt_test,
+            llm_split_used=True,
+        )
+        assert False, "expected PatchSplitUnrecoverableError"
+    except PatchSplitUnrecoverableError:
+        pass
 
 
 def test_ensure_valid_patch_split_falls_back_from_corrupt_test_patch(tmp_path: Path):

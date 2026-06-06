@@ -290,13 +290,27 @@ def remediate_c_install_from_log(
     log: str,
     *,
     repo: Path | None = None,
+    test_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     """Apply log-driven apt package fixes for C/CMake/Premake install failures."""
     if not is_c_harness_config(cfg, repo=repo):
         return cfg
+    from .harness_guards import log_indicates_ngtcp2_quictls_missing
+    from .integration_build import (
+        _test_paths_suggest_http3_pytest,
+        strip_http3_cmake_flags,
+    )
+
     out = remediate_apt_install_from_log(dict(cfg), log)
     out = merge_apt_into_config(out, list(_C_COMMON_APT))
-    return merge_apt_into_config(out, list(_base_apt_for_config(out, repo=repo)))
+    out = merge_apt_into_config(out, list(_base_apt_for_config(out, repo=repo)))
+    if log_indicates_ngtcp2_quictls_missing(log) and repo is not None:
+        from .integration_build import remediate_quictls_native_integration
+
+        out = remediate_quictls_native_integration(
+            out, repo, test_paths=test_paths
+        )
+    return out
 
 
 def ensure_c_install_config(
@@ -316,13 +330,26 @@ def ensure_c_install_config(
             test_patch=test_patch,
         )
         if log:
-            out = remediate_c_install_from_log(out, log, repo=repo)
+            out = remediate_c_install_from_log(
+                out, log, repo=repo, test_paths=test_paths
+            )
         return out
     if not is_c_harness_config(cfg, repo=repo):
         return cfg
     out = ensure_c_base_pre_install(dict(cfg), repo=repo)
+    if repo is not None and not is_premake_config(out, repo=repo):
+        from .runtests_build import sanitize_cmake_http3_for_harness
+
+        out = sanitize_cmake_http3_for_harness(
+            out, repo, test_paths=test_paths
+        )
+        tc = str(out.get("test_cmd") or "").lower()
+        if "ctest" in tc and not out.get("result_format"):
+            out["result_format"] = "ctest_log"
     if log:
-        out = remediate_c_install_from_log(out, log, repo=repo)
+        out = remediate_c_install_from_log(
+            out, log, repo=repo, test_paths=test_paths
+        )
     return out
 
 
@@ -336,6 +363,14 @@ _C_HARNESS_PRESERVE_KEYS: tuple[str, ...] = (
     "c_build_system",
     "result_format",
     "premake_test_cmd_base",
+    "cmake_runtests_build",
+    "cmake_runtests_numbers",
+    "runtests_test_cmd_base",
+    "runtests_setup_patch",
+    "runtests_setup_base",
+    "runtests_cmake_tool_symlinks",
+    "runtests_cmake_layout_adapter",
+    "runtests_cmake_harness_subdirs",
 )
 
 

@@ -31,6 +31,19 @@ class ParsedPR:
         return f"{self.owner}__{self.repo}-{self.number}"
 
 
+class BaseCommitUnreachableError(RuntimeError):
+    """Raised when ``base_commit`` is not present in a cloned repository."""
+
+    def __init__(self, commit: str, repo_id: str, *, detail: str = "") -> None:
+        self.commit = commit
+        self.repo_id = repo_id
+        self.detail = detail.strip()
+        msg = f"base_commit {commit[:12]} unreachable in {repo_id}"
+        if self.detail:
+            msg = f"{msg}: {self.detail}"
+        super().__init__(msg)
+
+
 def parse_pr_url(url: str) -> ParsedPR:
     m = PR_URL_RE.match(url.strip())
     if not m:
@@ -93,6 +106,7 @@ def strip_mailbox_to_unified(patch: str) -> str:
 @dataclass
 class PRMetadata:
     base_commit: str
+    head_commit: str
     title: str
     body: str
     created_at: str
@@ -101,19 +115,85 @@ class PRMetadata:
     closing_issue_numbers: list[int]
 
 
-def _fetch_base_commit_sha(pr: ParsedPR) -> str:
-    """Base branch tip SHA (merge target) via REST; ``baseRefOid`` was removed from ``gh pr view``."""
-    sha = run_gh(
+def _fetch_pull_refs(pr: ParsedPR) -> tuple[str, str, str | None, bool]:
+    """``(base_sha, head_sha, merge_commit_sha|None, merged)`` from GitHub REST."""
+    raw = run_gh(
         [
             "api",
             f"repos/{pr.owner}/{pr.repo}/pulls/{pr.number}",
             "-q",
-            ".base.sha",
+            "{base: .base.sha, head: .head.sha, merge: .merge_commit_sha, merged: .merged}",
+        ]
+    )
+    data: dict[str, Any] = json.loads(raw)
+    base_sha = str(data.get("base") or "").strip()
+    head_sha = str(data.get("head") or "").strip()
+    merge_sha = str(data.get("merge") or "").strip() or None
+    merged = bool(data.get("merged"))
+    if not base_sha:
+        raise RuntimeError(f"Empty base.sha for {pr.repo_id}#{pr.number}")
+    return base_sha, head_sha, merge_sha, merged
+
+
+def _fetch_merge_commit_first_parent(pr: ParsedPR, merge_commit_sha: str) -> str:
+    parent = run_gh(
+        [
+            "api",
+            f"repos/{pr.owner}/{pr.repo}/commits/{merge_commit_sha}",
+            "-q",
+            ".parents[0].sha",
         ]
     ).strip()
-    if not sha:
-        raise RuntimeError(f"Empty base.sha for {pr.repo_id}#{pr.number}")
-    return sha
+    if not parent:
+        raise RuntimeError(
+            f"No parent for merge commit {merge_commit_sha[:12]} on {pr.repo_id}#{pr.number}"
+        )
+    return parent
+
+
+def _fetch_compare_merge_base(pr: ParsedPR, base_sha: str, head_sha: str) -> str:
+    compare = f"{base_sha}...{head_sha}"
+    mb = run_gh(
+        [
+            "api",
+            f"repos/{pr.owner}/{pr.repo}/compare/{compare}",
+            "-q",
+            ".merge_base_commit.sha",
+        ]
+    ).strip()
+    if not mb:
+        raise RuntimeError(f"Empty merge_base_commit for {pr.repo_id}#{pr.number}")
+    return mb
+
+
+def _fetch_head_commit_sha(pr: ParsedPR) -> str:
+    """Post-PR tree tip: merge commit when merged, else PR head."""
+    _base_sha, head_sha, merge_sha, merged = _fetch_pull_refs(pr)
+    if merged and merge_sha:
+        return merge_sha
+    return head_sha
+
+
+def _fetch_base_commit_sha(pr: ParsedPR) -> str:
+    """
+    Pre-PR base commit for SWE-bench replay.
+
+    Merged PRs: first parent of the merge commit (state on target branch before merge).
+    Open/closed unmerged: ``merge_base_commit`` between PR base and head (not current ``base.sha`` tip).
+    Falls back to ``base.sha`` if compare/merge metadata is unavailable.
+    """
+    base_sha, head_sha, merge_sha, merged = _fetch_pull_refs(pr)
+    if merged and merge_sha:
+        try:
+            return _fetch_merge_commit_first_parent(pr, merge_sha)
+        except RuntimeError:
+            pass
+    if head_sha:
+        try:
+            return _fetch_compare_merge_base(pr, base_sha, head_sha)
+        except RuntimeError:
+            pass
+    return base_sha
 
 
 def _fetch_closing_issue_numbers(pr: ParsedPR) -> list[int]:
@@ -190,6 +270,7 @@ def fetch_pr_metadata(pr: ParsedPR) -> PRMetadata:
 
     return PRMetadata(
         base_commit=_fetch_base_commit_sha(pr),
+        head_commit=_fetch_head_commit_sha(pr),
         title=data.get("title") or "",
         body=data.get("body") or "",
         created_at=data.get("createdAt") or "",
@@ -219,11 +300,59 @@ def clone_repo_at(
         )
     else:
         subprocess.run(["git", "clone", url, str(dest)], check=True, timeout=timeout)
+    checkout = subprocess.run(
+        ["git", "-C", str(dest), "checkout", "-f", commit],
+        capture_output=True,
+        timeout=min(timeout, 600),
+    )
+    if checkout.returncode == 0:
+        return
+    # Commit may be unreachable after shallow clone or history rewrite — fetch then retry.
+    subprocess.run(
+        ["git", "-C", str(dest), "fetch", "origin", commit],
+        capture_output=True,
+        timeout=min(timeout, 600),
+        check=False,
+    )
     subprocess.run(
         ["git", "-C", str(dest), "checkout", "-f", commit],
         check=True,
         timeout=min(timeout, 600),
     )
+
+
+def validate_base_commit_reachable(repo: Path, commit: str) -> None:
+    """
+    Verify *commit* resolves in *repo* after ``clone_repo_at``.
+
+    Raises ``BaseCommitUnreachableError`` when the object is missing.
+    """
+    sha = str(commit or "").strip()
+    if not sha:
+        raise BaseCommitUnreachableError(sha, str(repo), detail="empty commit sha")
+    probe = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-e", f"{sha}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if probe.returncode != 0:
+        detail = (probe.stderr or probe.stdout or "").strip()
+        repo_id = ""
+        try:
+            origin = subprocess.run(
+                ["git", "-C", str(repo), "remote", "get-url", "origin"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if origin.returncode == 0:
+                m = re.search(r"github\.com[:/](?P<owner>[^/]+)/(?P<name>[^/.]+)", origin.stdout)
+                if m:
+                    repo_id = f"{m.group('owner')}/{m.group('name')}"
+        except (OSError, subprocess.SubprocessError):
+            pass
+        raise BaseCommitUnreachableError(sha, repo_id or str(repo), detail=detail)
 
 
 def git_ls_candidate_files(repo: Path, *, max_files: int = 400) -> list[str]:

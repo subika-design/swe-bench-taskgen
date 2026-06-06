@@ -61,6 +61,49 @@ def ruby_bundle_install_cmd(*, with_lock: bool) -> str:
     return f"{prefix}bundle install || true"
 
 
+def log_indicates_ruby_gem_not_found(log: str) -> bool:
+    """True when Bundler reports missing gems (often after patch updates Gemfile)."""
+    low = (log or "").lower()
+    return any(
+        needle in low
+        for needle in (
+            "bundler::gemnotfound",
+            "could not find gem",
+            "the following gems are missing",
+            "install missing gems with `bundle install`",
+            "install missing gems with 'bundle install'",
+            "bundler can't satisfy",
+            "gem not found",
+        )
+    )
+
+
+def ruby_bundle_install_shell_cmd(cfg: dict[str, Any] | None = None) -> str:
+    install = str((cfg or {}).get("install") or "").strip()
+    if install and install != "true" and "bundle install" in install:
+        return install
+    return ruby_bundle_install_cmd(with_lock=False)
+
+
+def ruby_post_patch_bundle_install_shell(
+    install_config: dict[str, Any] | None = None,
+    *,
+    repo_dir: str = "/testbed",
+) -> str:
+    """Re-run ``bundle install`` after patches when ``bundle check`` fails."""
+    qrepo = repo_dir if repo_dir.startswith("/") else f'"{repo_dir}"'
+    cmd = ruby_bundle_install_shell_cmd(install_config)
+    return f"""
+_ruby_post_patch_bundle_install() {{
+  if (cd {qrepo} && bundle check >/dev/null 2>&1); then
+    return 0
+  fi
+  echo "[docker] bundle check failed after patch; re-running bundle install" >&2
+  (cd {qrepo} && {cmd}) || true
+}}
+"""
+
+
 def resolve_ruby_version_for_repo(repo: Path) -> str | None:
     dot = repo / ".ruby-version"
     if dot.is_file():
@@ -152,17 +195,74 @@ def runner_from_install_config(
     return "rspec"
 
 
-def ruby_test_cmd_for_runner(runner: RubyTestRunner) -> str:
+def _strip_ruby_rspec_junit_fallback(tc: str) -> str:
+    """Remove silent fallback that drops JUnit output when the formatter fails."""
+    s = tc.strip()
+    s = re.sub(
+        r"\s*2>/dev/null\s*\|\|\s*bundle exec rspec\s*$",
+        "",
+        s,
+        flags=re.I,
+    )
+    return s.strip()
+
+
+def ruby_rspec_spec_paths(test_paths: list[str] | None) -> list[str]:
+    """Repo-relative ``*_spec.rb`` paths from ``test_patch`` for scoped ``rspec``."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in test_paths or []:
+        rel = raw.replace("\\", "/").strip().lstrip("/")
+        if not rel or not _path_likely_rspec(rel):
+            continue
+        if rel not in seen:
+            seen.add(rel)
+            out.append(rel)
+    return sorted(out)
+
+
+def ruby_test_cmd_for_docker_entry(cfg: dict[str, Any]) -> str:
+    """CI/heuristic ``test_cmd`` for Docker when it is a Ruby test invocation."""
+    from .ci_fidelity import should_preserve_ci_test_cmd
+
+    tc = _strip_ruby_rspec_junit_fallback(str(cfg.get("test_cmd") or "").strip())
+    if not tc or tc == "true" or "pytest" in tc.lower():
+        return ""
+    runner = runner_from_install_config(cfg)
+    low = tc.lower()
+    if runner == "rspec" and "rspec" not in low and "rake" not in low and not should_preserve_ci_test_cmd(
+        cfg
+    ):
+        return ""
+    if runner == "minitest" and "minitest" not in low and "rake" not in low and not should_preserve_ci_test_cmd(
+        cfg
+    ):
+        return ""
+    if "__JUNIT_OUT__" in tc:
+        return tc
+    if runner == "rspec" and "rspec" in low and "RspecJunitFormatter" not in tc and "--format" not in tc:
+        return f"{tc} --format RspecJunitFormatter --out __JUNIT_OUT__"
+    return tc
+
+
+def ruby_test_cmd_for_runner(
+    runner: RubyTestRunner,
+    *,
+    spec_paths: list[str] | None = None,
+) -> str:
     """Discover-time ``test_cmd`` template (``__JUNIT_OUT__`` substituted in harness)."""
+    import shlex
+
     if runner == "minitest":
         return (
-            "bundle exec rake test TESTOPTS='--junit' 2>/dev/null || "
-            "bundle exec ruby -Itest"
+            "bundle exec rake test TESTOPTS='--junit' "
+            "|| bundle exec ruby -Itest"
         )
-    return (
-        "bundle exec rspec --format RspecJunitFormatter --out __JUNIT_OUT__ "
-        "2>/dev/null || bundle exec rspec"
-    )
+    cmd = "bundle exec rspec"
+    paths = ruby_rspec_spec_paths(spec_paths)
+    if paths:
+        cmd += " " + " ".join(shlex.quote(p) for p in paths)
+    return f"{cmd} --format RspecJunitFormatter --out __JUNIT_OUT__"
 
 
 def _ruby_post_install_junit_formatter_lines(runner: RubyTestRunner) -> list[str]:
@@ -201,13 +301,29 @@ def apply_ruby_runner_to_config(
     runner = runner_from_install_config(out, repo, test_paths=test_paths)
     out["ruby_test_runner"] = runner
     out["language"] = "ruby"
-    tc = str(out.get("test_cmd") or "").strip()
-    if not tc or tc == "true" or "pytest" in tc.lower():
-        out["test_cmd"] = ruby_test_cmd_for_runner(runner)
-    elif runner == "rspec" and "rspec" not in tc.lower():
-        out["test_cmd"] = ruby_test_cmd_for_runner("rspec")
-    elif runner == "minitest" and "rspec" in tc.lower() and "minitest" not in tc.lower():
-        out["test_cmd"] = ruby_test_cmd_for_runner("minitest")
+    from .ci_fidelity import should_preserve_ci_test_cmd
+
+    tc_raw = str(out.get("test_cmd") or "").strip()
+    tc = _strip_ruby_rspec_junit_fallback(tc_raw)
+    preserve_ci = should_preserve_ci_test_cmd(out)
+    spec_paths = ruby_rspec_spec_paths(test_paths)
+    if not preserve_ci:
+        if not tc or tc == "true" or "pytest" in tc.lower():
+            out["test_cmd"] = ruby_test_cmd_for_runner(runner, spec_paths=spec_paths)
+        elif runner == "rspec" and "rspec" not in tc.lower():
+            out["test_cmd"] = ruby_test_cmd_for_runner("rspec", spec_paths=spec_paths)
+        elif (
+            runner == "minitest"
+            and "rspec" in tc.lower()
+            and "minitest" not in tc.lower()
+        ):
+            out["test_cmd"] = ruby_test_cmd_for_runner("minitest")
+        elif runner == "rspec" and spec_paths:
+            out["test_cmd"] = ruby_test_cmd_for_runner("rspec", spec_paths=spec_paths)
+        elif tc != tc_raw:
+            out["test_cmd"] = tc
+    elif tc != tc_raw:
+        out["test_cmd"] = tc
     return _merge_ruby_post_install(out, runner)
 
 
@@ -229,6 +345,80 @@ def ensure_ruby_docker_specs(
         specs["ruby_version"] = rv or DEFAULT_RUBY_VERSION
     out["docker_specs"] = specs
     return out
+
+
+def filter_rspec_map_to_test_patch_paths(
+    case_map: dict[str, str],
+    test_patch_paths: list[str],
+) -> dict[str, str]:
+    """Keep only RSpec node ids belonging to ``test_patch`` spec files."""
+    if not case_map or not test_patch_paths:
+        return dict(case_map)
+    return {
+        k: v
+        for k, v in case_map.items()
+        if rspec_junit_nodeid_in_test_patch_paths(k, test_patch_paths)
+    }
+
+
+def rspec_log_indicates_examples_ran(log: str) -> bool:
+    """True when an RSpec summary line reports examples ran (pass or fail)."""
+    return bool(re.search(r"\b\d+\s+examples?,", log or "", re.I))
+
+
+def rspec_log_indicates_all_passed(log: str) -> bool:
+    low = (log or "").lower()
+    if "no examples found" in low and "0 failures" not in low:
+        return False
+    m = re.search(r"(\d+)\s+examples?,\s*0\s+failures?", low)
+    return m is not None and int(m.group(1)) > 0
+
+
+def refine_ruby_junit_maps_for_discover(
+    base_map: dict[str, str],
+    patch_map: dict[str, str],
+    *,
+    test_patch_paths: list[str],
+    work_dir: Path,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Scope JUnit maps to ``test_patch`` spec paths and fall back to RSpec logs when
+    patch XML is empty but scoped examples ran (formatter/harvest miss).
+    """
+    from .test_log_parsers import parse_rspec_log
+
+    tp = ruby_rspec_spec_paths(test_patch_paths)
+    scoped_base = filter_rspec_map_to_test_patch_paths(base_map, tp)
+    scoped_patch = filter_rspec_map_to_test_patch_paths(patch_map, tp)
+
+    if not scoped_patch:
+        patch_log = work_dir / "test-patch.log"
+        if patch_log.is_file() and rspec_log_indicates_examples_ran(
+            patch_log.read_text(encoding="utf-8", errors="replace")
+        ):
+            log_map = parse_rspec_log(
+                patch_log.read_text(encoding="utf-8", errors="replace")
+            )
+            scoped_patch = filter_rspec_map_to_test_patch_paths(log_map, tp)
+            if (
+                not scoped_patch
+                and scoped_base
+                and tp
+                and rspec_log_indicates_all_passed(
+                    patch_log.read_text(encoding="utf-8", errors="replace")
+                )
+            ):
+                scoped_patch = {k: "passed" for k in scoped_base}
+
+    if not scoped_base:
+        base_log = work_dir / "test-base.log"
+        if base_log.is_file():
+            log_map = parse_rspec_log(
+                base_log.read_text(encoding="utf-8", errors="replace")
+            )
+            scoped_base = filter_rspec_map_to_test_patch_paths(log_map, tp)
+
+    return scoped_base, scoped_patch
 
 
 def rspec_junit_nodeid_in_test_patch_paths(nodeid: str, paths: list[str]) -> bool:
@@ -309,17 +499,7 @@ def remediate_ruby_install_from_log(cfg: dict[str, Any], log: str) -> dict[str, 
             "minitest/reporters",
         )
     )
-    gem_missing = any(
-        needle in low
-        for needle in (
-            "could not find gem",
-            "gem not found",
-            "bundler can't satisfy",
-            "bundle install",
-            "installation error",
-            "bundler::gemnotfound",
-        )
-    )
+    gem_missing = log_indicates_ruby_gem_not_found(log)
     if formatter_missing or gem_missing:
         out = _merge_ruby_post_install(out, runner)
         install = str(out.get("install") or "").strip()

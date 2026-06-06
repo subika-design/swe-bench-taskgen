@@ -3,6 +3,9 @@
 from pathlib import Path
 
 from swe_rebench_pr.java_build import (
+    gradle_default_build_install_command,
+    gradle_junit_report_roots,
+    install_cmd_is_gradle_chmod_only,
     GRADLE_HARNESS_INIT_REL,
     _GRADLE_HARNESS_INIT_CONTENT,
     detect_java_build_system,
@@ -250,3 +253,51 @@ def test_merge_java_preserves_jdk8_and_compiler_flags():
     assert merged["docker_image"] == "maven:3.9-eclipse-temurin-8"
     assert "maven.compiler.source=1.6" in merged["install"]
     assert "maven.compiler.source=1.6" in merged["test_cmd"]
+
+
+def test_install_cmd_is_gradle_chmod_only():
+    assert install_cmd_is_gradle_chmod_only("chmod +x ./gradlew 2>/dev/null || true")
+    assert not install_cmd_is_gradle_chmod_only(
+        gradle_default_build_install_command()
+    )
+
+
+def test_java_install_config_gradle_includes_build(tmp_path: Path):
+    from swe_rebench_pr.java_gradle_llm import resolve_gradle_projects_for_test_paths
+
+    (tmp_path / "gradlew").write_text("#!/bin/sh\n", encoding="utf-8")
+    (tmp_path / "settings.gradle").write_text(
+        "rootProject.name = 'picocli'\ninclude 'picocli-tests-java8'\n",
+        encoding="utf-8",
+    )
+    test_dir = tmp_path / "picocli-tests-java8" / "src" / "test" / "java" / "picocli"
+    test_dir.mkdir(parents=True)
+    (test_dir / "AutoCompleteTest.java").write_text("package picocli;\n", encoding="utf-8")
+    paths = ["picocli-tests-java8/src/test/java/picocli/AutoCompleteTest.java"]
+    gradle_map = resolve_gradle_projects_for_test_paths(tmp_path, paths, api_key=None)
+    cfg = java_install_config_for_repo(
+        tmp_path, test_paths=paths, gradle_path_by_test_path=gradle_map
+    )
+    assert "build -x test" in cfg["install"]
+    assert cfg["gradle_junit_roots"] == ["picocli-tests-java8/build/test-results"]
+    assert ":picocli-tests-java8:test" in cfg["test_cmd"]
+    assert ":picocli:test" not in cfg["test_cmd"]
+
+
+def test_merge_java_harness_restores_build_install_after_chmod_llm():
+    before = {
+        "language": "java",
+        "java_build_system": "gradle",
+        "install": gradle_default_build_install_command(),
+        "post_install": ["./gradlew :picocli:compileTestJava -x check || true"],
+        "test_cmd": "./gradlew :picocli:test --tests 'picocli.Foo'",
+    }
+    llm_out = {
+        "install": "chmod +x ./gradlew 2>/dev/null || true",
+        "post_install": [],
+        "test_cmd": "pytest -rA",
+    }
+    merged = merge_java_harness_fields_after_llm(before, llm_out)
+    assert "build -x test" in merged["install"]
+    assert merged.get("post_install")
+    assert "./gradlew" in merged["test_cmd"]

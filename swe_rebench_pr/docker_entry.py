@@ -137,6 +137,55 @@ def _python_pytest_report_flags(install_config: dict[str, Any]) -> str:
     return "-q"
 
 
+def _python_test_cmd_block(install_config: dict[str, Any]) -> str:
+    from .python_build import (
+        python_docker_test_cmd_for_entry,
+        python_pytest_cmd_without_collection_paths,
+    )
+
+    tc = python_docker_test_cmd_for_entry(install_config)
+    if not tc:
+        return 'PY_TEST_CMD=""\nPY_TEST_CMD_FLAGS=""\n'
+    flags_src = python_pytest_cmd_without_collection_paths(
+        str(install_config.get("test_cmd") or tc)
+    )
+    flags = python_docker_test_cmd_for_entry(
+        {**install_config, "test_cmd": flags_src}
+    )
+    return (
+        f'PY_TEST_CMD="{_sh_escape_double(tc)}"\n'
+        f'PY_TEST_CMD_FLAGS="{_sh_escape_double(flags)}"\n'
+    )
+
+
+def _python_pytest_run_fn(report_flags: str) -> str:
+    return rf"""
+_run_pytest_phase() {{
+  local junit_out="$1"
+  local log="$2"
+  if [[ -n "${{PY_TEST_CMD:-}}" ]]; then
+    local cmd="${{PY_TEST_CMD//__JUNIT_OUT__/$junit_out}}"
+    if [[ ${{#T[@]}} -gt 0 && -n "${{PY_TEST_CMD_FLAGS:-}}" ]]; then
+      cmd="${{PY_TEST_CMD_FLAGS//__JUNIT_OUT__/$junit_out}}"
+      echo "[docker] pytest flags+${{#T[@]}} target(s)" >&2
+      eval "$cmd" "${{T[@]}}" 2>&1 | tee "$log" || true
+    else
+      echo "[docker] pytest test_cmd=$cmd" >&2
+      if [[ ${{#T[@]}} -gt 0 ]]; then
+        eval "$cmd" "${{T[@]}}" 2>&1 | tee "$log" || true
+      else
+        eval "$cmd" 2>&1 | tee "$log" || true
+      fi
+    fi
+  else
+    python3 -m pytest "${{PYT_EXTRA[@]}}" "${{T[@]}}" \\
+      --junitxml="$junit_out" -o junit_family=xunit2 --tb=no {report_flags} 2>&1 | tee "$log" || true
+  fi
+  python3 /w/empty_junit_if_missing.py "$junit_out" "$log" || true
+}}
+"""
+
+
 def _pytest_plugin_block(install_config: dict[str, Any]) -> str:
     plugins = install_config.get("pytest_plugins") or []
     if not isinstance(plugins, list):
@@ -155,6 +204,8 @@ def _common_header(
     harness_conda: bool = False,
     harness_env_only: bool = False,
     tests_only: bool = False,
+    install_config: dict[str, Any] | None = None,
+    language: str = "",
 ) -> str:
     harness_env_block = ""
     setup_repo_block = ""
@@ -171,11 +222,20 @@ conda activate testbed
 git reset --hard "${{SWEBENCH_BASE_COMMIT:-HEAD}}"
 {_js_git_clean_excludes()}
 """
+        restore_block = ""
+        if install_config and language:
+            from .runtime_deps import runtime_deps_restore_shell
+
+            restore_block = runtime_deps_restore_shell(
+                language, install_config, repo_dir=repo_dir
+            )
         return f"""#!/bin/bash
 set -euo pipefail
-{harness_env_block}cd {_sh_quote(repo_dir)}
-git config --global --add safe.directory {_sh_quote(repo_dir)} || true
+REPO_DIR={_sh_quote(repo_dir)}
+{harness_env_block}cd "$REPO_DIR"
+git config --global --add safe.directory "$REPO_DIR" || true
 {reset_block}
+{restore_block}
 mapfile -t T < /w/targets.txt || true
 """
 
@@ -428,19 +488,12 @@ def _python_body(
             + restore_repo
         )
     else:
-        run_tests_fn = ""
-        pytest_base = (
-            native_block
-            + rf"""python3 -m pytest "${{PYT_EXTRA[@]}}" "${{T[@]}}" """
-            + rf"""--junitxml=/w/junit-base.xml -o junit_family=xunit2 --tb=no {report_flags} || true
-{restore_repo}"""
-        )
+        run_tests_fn = _python_pytest_run_fn(report_flags)
+        pytest_base = native_block + "_run_pytest_phase /w/junit-base.xml /w/test-base.log\n" + restore_repo
         pytest_patch = (
-            native_block
-            + rf"""python3 -m pytest "${{PYT_EXTRA[@]}}" "${{T[@]}}" """
-            + rf"""--junitxml=/w/junit-patch.xml -o junit_family=xunit2 --tb=no {report_flags} || true
-{restore_repo}"""
+            native_block + "_run_pytest_phase /w/junit-patch.xml /w/test-patch.log\n" + restore_repo
         )
+    py_test_cmd_block = _python_test_cmd_block(install_config)
     body = (
         _common_header(
             repo_dir=repo_dir,
@@ -455,6 +508,7 @@ def _python_body(
         + env_block
         + _eval_commands_block(install_config)
         + integration_cmd_block
+        + py_test_cmd_block
         + "PYT_EXTRA=()\n"
         + (plugin_block + "\n" if plugin_block else "")
         + extra_args_block
@@ -1000,6 +1054,7 @@ _run_js_tests /w/junit-patch.xml /w/test-patch.log
 
 
 def _php_body(
+    install_config: dict[str, Any],
     run_pip_freeze: bool,
     *,
     repo_dir: str = "/w/repo",
@@ -1008,6 +1063,14 @@ def _php_body(
     harness_env_only: bool = False,
     tests_only: bool = False,
 ) -> str:
+    test_cmd = str(install_config.get("test_cmd") or "").strip()
+    runner = str(install_config.get("php_test_runner") or "").strip()
+    restore = ""
+    if not tests_only:
+        from .runtime_deps import runtime_deps_restore_shell
+
+        restore = runtime_deps_restore_shell("php", install_config, repo_dir=repo_dir)
+    restore_mid = (restore.strip() + "\n") if restore.strip() else ""
     return (
         _common_header(
             repo_dir=repo_dir,
@@ -1015,27 +1078,55 @@ def _php_body(
             harness_conda=harness_conda,
             harness_env_only=harness_env_only,
             tests_only=tests_only,
+            install_config=install_config,
+            language="php",
         )
         + _empty_junit_both()
+        + f'PHP_TEST_CMD="{test_cmd}"\n'
+        + f'PHP_TEST_RUNNER="{runner}"\n'
         + _apply_one_fn()
         + r"""_run_php_tests() {
   local junit_out="$1"
-  if [[ -x vendor/bin/phpunit ]]; then
-    vendor/bin/phpunit --log-junit "$junit_out" "${T[@]}" 2>/dev/null || vendor/bin/phpunit --log-junit "$junit_out" || true
-  else
-    phpunit --log-junit "$junit_out" 2>/dev/null || true
+  local log_out="$2"
+  if [[ -n "${PHP_TEST_CMD:-}" ]]; then
+    local cmd="${PHP_TEST_CMD//__JUNIT_OUT__/$junit_out}"
+    echo "[docker] php test_cmd=$cmd" >&2
+    if [[ ${#T[@]} -gt 0 ]]; then
+      eval "$cmd" "${T[@]}" 2>&1 | tee "$log_out" || true
+    else
+      eval "$cmd" 2>&1 | tee "$log_out" || true
+    fi
+    return 0
   fi
+  if [[ -x vendor/bin/simple-phpunit ]]; then
+    echo "[docker] php simple-phpunit ${#T[@]} path(s)" >&2
+    vendor/bin/simple-phpunit --log-junit "$junit_out" "${T[@]}" 2>&1 | tee "$log_out" || true
+    return 0
+  fi
+  if [[ -x vendor/bin/phpunit ]]; then
+    echo "[docker] php phpunit ${#T[@]} path(s)" >&2
+    vendor/bin/phpunit --log-junit "$junit_out" "${T[@]}" 2>&1 | tee "$log_out" || true
+    return 0
+  fi
+  echo "[docker] php: no vendor/bin/phpunit or simple-phpunit" >&2
+  phpunit --log-junit "$junit_out" 2>&1 | tee "$log_out" || true
 }
 echo "[docker] phpunit (base + test_patch only)" >&2
 _apply_one /w/test.patch || exit 1
-_run_php_tests /w/junit-base.xml
+_run_php_tests /w/junit-base.xml /w/test-base.log
 echo "[docker] reset to base_commit" >&2
 git reset --hard "${SWEBENCH_BASE_COMMIT:-HEAD}"
 git clean -ffdx 2>/dev/null || true
-echo "[docker] phpunit (test_patch + impl.patch)" >&2
+"""
+        + restore_mid
+        + r"""echo "[docker] phpunit (test_patch + impl.patch)" >&2
 _apply_one /w/test.patch || exit 1
 _apply_one /w/impl.patch || exit 1
-_run_php_tests /w/junit-patch.xml
+if [[ -n "${DISCOVERY_PATCH_FULL_SUITE:-}" ]]; then
+  echo "[docker] patch-phase discovery: full phpunit (no T[@] scope)" >&2
+  T=()
+fi
+_run_php_tests /w/junit-patch.xml /w/test-patch.log
 """
         + (_pip_freeze_block() if run_pip_freeze else "")
     )
@@ -1054,11 +1145,16 @@ _run_ruby_tests() {
   local junit_out="$1"
   local log_out="$2"
   _ruby_ensure_junit_formatter
-  echo "[docker] rspec ${#T[@]} path(s) -> $junit_out" >&2
   if [[ ${#T[@]} -gt 0 ]]; then
+    echo "[docker] rspec ${#T[@]} path(s) -> $junit_out" >&2
     bundle exec rspec "${T[@]}" --format RspecJunitFormatter --out "$junit_out" \
       2>&1 | tee "$log_out" || true
+  elif [[ -n "${RUBY_TEST_CMD:-}" ]]; then
+    local cmd="${RUBY_TEST_CMD//__JUNIT_OUT__/$junit_out}"
+    echo "[docker] ruby test_cmd=$cmd" >&2
+    eval "$cmd" 2>&1 | tee "$log_out" || true
   else
+    echo "[docker] rspec (full suite) -> $junit_out" >&2
     bundle exec rspec --format RspecJunitFormatter --out "$junit_out" \
       2>&1 | tee "$log_out" || true
   fi
@@ -1074,6 +1170,17 @@ def _ruby_minitest_run_block() -> str:
 _run_ruby_tests() {
   local junit_out="$1"
   local log_out="$2"
+  if [[ -n "${RUBY_TEST_CMD:-}" ]]; then
+    local cmd="${RUBY_TEST_CMD//__JUNIT_OUT__/$junit_out}"
+    echo "[docker] ruby test_cmd=$cmd" >&2
+    if [[ ${#T[@]} -gt 0 ]]; then
+      eval "$cmd" "${T[@]}" 2>&1 | tee "$log_out" || true
+    else
+      eval "$cmd" 2>&1 | tee "$log_out" || true
+    fi
+    python3 /w/empty_junit_if_missing.py "$junit_out" "$log_out" || true
+    return 0
+  fi
   _ruby_ensure_minitest_junit
   echo "[docker] minitest ${#T[@]} path(s) -> $junit_out" >&2
   if [[ ${#T[@]} -gt 0 ]]; then
@@ -1091,16 +1198,29 @@ _run_ruby_tests() {
 """
 
 
-def _ruby_two_phase_tail(runner_label: str) -> str:
+def _ruby_two_phase_tail(
+    runner_label: str,
+    *,
+    restore_block: str = "",
+    post_patch_bundle_block: str = "",
+) -> str:
+    restore = (restore_block.strip() + "\n") if restore_block.strip() else ""
+    post_patch = (post_patch_bundle_block.strip() + "\n") if post_patch_bundle_block.strip() else ""
+    if post_patch and not post_patch.endswith("\n"):
+        post_patch = post_patch + "\n"
     return rf"""echo "[docker] {runner_label} (base + test_patch only)" >&2
 _apply_one /w/test.patch || exit 1
 _run_ruby_tests /w/junit-base.xml /w/test-base.log
 echo "[docker] reset to base_commit" >&2
 git reset --hard "${{SWEBENCH_BASE_COMMIT:-HEAD}}"
 git clean -ffdx 2>/dev/null || true
-echo "[docker] {runner_label} (test_patch + impl.patch)" >&2
+{restore}echo "[docker] {runner_label} (test_patch + impl.patch)" >&2
 _apply_one /w/test.patch || exit 1
 _apply_one /w/impl.patch || exit 1
+{post_patch}if [[ -n "${{DISCOVERY_PATCH_FULL_SUITE:-}}" ]]; then
+  echo "[docker] patch-phase discovery: full rspec (no T[@] scope)" >&2
+  T=()
+fi
 _run_ruby_tests /w/junit-patch.xml /w/test-patch.log
 """
 
@@ -1115,12 +1235,26 @@ def _ruby_body(
     harness_env_only: bool = False,
     tests_only: bool = False,
 ) -> str:
-    from .ruby_build import runner_from_install_config
+    from .ruby_build import (
+        runner_from_install_config,
+        ruby_post_patch_bundle_install_shell,
+        ruby_test_cmd_for_docker_entry,
+    )
 
     cfg = install_config if isinstance(install_config, dict) else {}
     runner = runner_from_install_config(cfg)
+    ruby_cmd = ruby_test_cmd_for_docker_entry(cfg)
+    ruby_cmd_line = (
+        f'RUBY_TEST_CMD="{_sh_escape_double(ruby_cmd)}"\n' if ruby_cmd else 'RUBY_TEST_CMD=""\n'
+    )
     run_block = _ruby_minitest_run_block() if runner == "minitest" else _ruby_rspec_run_block()
     label = "minitest" if runner == "minitest" else "rspec"
+    restore = ""
+    post_patch_bundle = ruby_post_patch_bundle_install_shell(cfg, repo_dir=repo_dir)
+    if not tests_only:
+        from .runtime_deps import runtime_deps_restore_shell
+
+        restore = runtime_deps_restore_shell("ruby", cfg, repo_dir=repo_dir)
     return (
         _common_header(
             repo_dir=repo_dir,
@@ -1128,12 +1262,173 @@ def _ruby_body(
             harness_conda=harness_conda,
             harness_env_only=harness_env_only,
             tests_only=tests_only,
+            install_config=cfg,
+            language="ruby",
         )
         + _empty_junit_both()
         + f'RUBY_TEST_RUNNER="{runner}"\n'
+        + 'export SKIP_REPO_JUNIT_HARVEST=1\n'
+        + ruby_cmd_line
+        + _test_env_block(cfg)
         + _apply_one_fn()
         + run_block
-        + _ruby_two_phase_tail(label)
+        + post_patch_bundle
+        + _ruby_two_phase_tail(
+            label,
+            restore_block=restore,
+            post_patch_bundle_block="_ruby_post_patch_bundle_install",
+        )
+        + (_pip_freeze_block() if run_pip_freeze else "")
+    )
+
+
+def _cmake_runtests_invoke_block(install_config: dict[str, Any], *, repo_dir: str) -> str:
+    """Scoped runtests env wrapper (no global LD_LIBRARY_PATH export)."""
+    if not install_config.get("cmake_runtests_build"):
+        return ""
+    from .runtests_build import runtests_cmake_invoke_block
+
+    return runtests_cmake_invoke_block(
+        repo_dir=repo_dir,
+        curl_tool_symlinks=bool(install_config.get("runtests_cmake_tool_symlinks")),
+    )
+
+
+def _cmake_runtests_verify_tools_block(
+    *,
+    repo_dir: str,
+    layout_adapter: bool = False,
+    harness_subdirs: list[Any] | None = None,
+) -> str:
+    root = repo_dir.rstrip("/")
+    if layout_adapter:
+        from .runtests_build import runtests_cmake_harness_preflight_shell
+
+        harness_sh = runtests_cmake_harness_preflight_shell(harness_subdirs or [])
+        return f"""
+_runtests_verify_tools() {{
+  _runtests_invoke '
+    cd tests || exit 0
+    for bin in ../build/src/curl ../src/curlinfo; do
+      [[ -x "$bin" ]] || continue
+      if ! "$bin" -V >/dev/null 2>&1; then
+        echo "[docker] runtests preflight: $bin -V failed (check LD_LIBRARY_PATH)" >&2
+      else
+        echo "[docker] runtests preflight: $bin ok" >&2
+      fi
+    done
+    {harness_sh}
+  ' || true
+}}
+"""
+    return f"""
+_runtests_verify_tools() {{
+  _runtests_invoke '
+    for bin in "{root}/build/src/curl" "{root}/build/curl"; do
+      [[ -x "$bin" ]] || continue
+      if ! "$bin" -V >/dev/null 2>&1; then
+        echo "[docker] runtests preflight: $bin -V failed (check LD_LIBRARY_PATH)" >&2
+      else
+        echo "[docker] runtests preflight: $bin ok" >&2
+      fi
+      exit 0
+    done
+    echo "[docker] runtests preflight: no tool binary under build/src or build/" >&2
+  ' || true
+}}
+"""
+
+
+def _cmake_runtests_setup_shell(lines: list[Any], *, repo_dir: str, log_tag: str) -> str:
+    qrepo = _sh_quote(repo_dir)
+    body: list[str] = []
+    for ln in lines:
+        if not isinstance(ln, str) or not ln.strip():
+            continue
+        cmd = ln.strip()
+        body.append(
+            f'echo "[docker] runtests setup ({log_tag}): " {_sh_quote(cmd)} >&2\n'
+            f"(cd {qrepo} && {cmd}) 2>&1 | tee -a /w/runtests-setup-{log_tag}.log || true"
+        )
+    return "\n".join(body) + ("\n" if body else "")
+
+
+def _cmake_runtests_reinstall_block() -> str:
+    return r"""
+_runtests_cmake_reinstall() {
+  echo "[docker] re-running cmake install for runtests" >&2
+  bash /w/project_install.sh 2>&1 | tee /w/runtests-reinstall.log || true
+  bash /w/post_install.sh 2>&1 | tee -a /w/runtests-reinstall.log || true
+}
+"""
+
+
+def _cmake_runtests_body(
+    run_pip_freeze: bool,
+    install_config: dict[str, Any] | None = None,
+    *,
+    repo_dir: str = "/w/repo",
+    skip_install: bool = False,
+    harness_conda: bool = False,
+    harness_env_only: bool = False,
+    tests_only: bool = False,
+) -> str:
+    cfg = install_config or {}
+    test_cmd = str(cfg.get("test_cmd") or "./tests/runtests.pl -a -am -p").strip()
+    test_cmd_base = str(cfg.get("runtests_test_cmd_base") or test_cmd).strip()
+    setup_patch = cfg.get("runtests_setup_patch") or []
+    setup_base = cfg.get("runtests_setup_base") or []
+    env_block = _cmake_runtests_invoke_block(cfg, repo_dir=repo_dir)
+    setup_base_sh = _cmake_runtests_setup_shell(
+        setup_base if isinstance(setup_base, list) else [],
+        repo_dir=repo_dir,
+        log_tag="base",
+    )
+    setup_patch_sh = _cmake_runtests_setup_shell(
+        setup_patch if isinstance(setup_patch, list) else [],
+        repo_dir=repo_dir,
+        log_tag="patch",
+    )
+    reinstall_fn = _cmake_runtests_reinstall_block()
+    verify_fn = _cmake_runtests_verify_tools_block(
+        repo_dir=repo_dir,
+        layout_adapter=bool(cfg.get("runtests_cmake_layout_adapter")),
+        harness_subdirs=cfg.get("runtests_cmake_harness_subdirs") or [],
+    )
+    return (
+        _common_header(
+            repo_dir=repo_dir,
+            skip_install=skip_install,
+            harness_conda=harness_conda,
+            harness_env_only=harness_env_only,
+            tests_only=tests_only,
+            install_config=cfg,
+            language="c",
+        )
+        + env_block
+        + verify_fn
+        + reinstall_fn
+        + f'RUNTESTS_CMD="{test_cmd}"\n'
+        + f'RUNTESTS_CMD_BASE="{test_cmd_base}"\n'
+        + _apply_one_fn()
+        + r"""echo "[docker] runtests (base + test_patch only)" >&2
+_apply_one /w/test.patch || exit 1
+"""
+        + setup_base_sh
+        + r"""_runtests_verify_tools
+_runtests_invoke "$RUNTESTS_CMD_BASE" 2>&1 | tee /w/test-base.log || true
+echo "[docker] reset to base_commit" >&2
+git reset --hard "${SWEBENCH_BASE_COMMIT:-HEAD}"
+git clean -ffdx 2>/dev/null || git clean -ffdx
+echo "[docker] runtests (test_patch + impl.patch)" >&2
+_apply_one /w/test.patch || exit 1
+_apply_one /w/impl.patch || exit 1
+_runtests_cmake_reinstall
+"""
+        + setup_patch_sh
+        + r"""_runtests_verify_tools
+_runtests_invoke "$RUNTESTS_CMD" 2>&1 | tee /w/test-patch.log || true
+"""
         + (_pip_freeze_block() if run_pip_freeze else "")
     )
 
@@ -1149,6 +1444,16 @@ def _c_body(
     tests_only: bool = False,
 ) -> str:
     cfg = install_config or {}
+    if cfg.get("cmake_runtests_build"):
+        return _cmake_runtests_body(
+            run_pip_freeze,
+            install_config,
+            repo_dir=repo_dir,
+            skip_install=skip_install,
+            harness_conda=harness_conda,
+            harness_env_only=harness_env_only,
+            tests_only=tests_only,
+        )
     from .c_build import is_premake_config
 
     if is_premake_config(cfg):
@@ -1187,6 +1492,18 @@ bash -lc "$PREMAKE_TEST_CMD" 2>&1 | tee /w/test-patch.log || true
         )
 
     test_cmd = str(cfg.get("test_cmd") or "cd build && ctest --output-on-failure -j\"$(nproc)\"").strip()
+    use_ctest_log = "ctest" in test_cmd and not cfg.get("native_integration_build")
+    junit_block = "" if use_ctest_log else _empty_junit_both()
+    ctest_junit_tail = ""
+    if not use_ctest_log:
+        ctest_junit_tail = r"""
+python3 /w/empty_junit_if_missing.py /w/junit-base.xml /w/test-base.log
+"""
+    ctest_junit_tail_patch = ""
+    if not use_ctest_log:
+        ctest_junit_tail_patch = r"""
+python3 /w/empty_junit_if_missing.py /w/junit-patch.xml /w/test-patch.log
+"""
     return (
         _common_header(
             repo_dir=repo_dir,
@@ -1195,7 +1512,7 @@ bash -lc "$PREMAKE_TEST_CMD" 2>&1 | tee /w/test-patch.log || true
             harness_env_only=harness_env_only,
             tests_only=tests_only,
         )
-        + _empty_junit_both()
+        + junit_block
         + f'C_TEST_CMD="{test_cmd}"\n'
         + r"""echo "[docker] c test (before patch)" >&2
 if [[ -d build ]] && [[ "$C_TEST_CMD" == *ctest* ]]; then
@@ -1205,8 +1522,8 @@ elif [[ -f Makefile ]] && [[ "$C_TEST_CMD" == *make*test* ]]; then
 else
   bash -lc "$C_TEST_CMD" 2>&1 | tee /w/test-base.log || true
 fi
-python3 /w/empty_junit_if_missing.py /w/junit-base.xml /w/test-base.log
 """
+        + ctest_junit_tail
         + _apply_patches_block()
         + r"""echo "[docker] c test (after patch)" >&2
 if [[ -d build ]] && [[ "$C_TEST_CMD" == *ctest* ]]; then
@@ -1216,8 +1533,8 @@ elif [[ -f Makefile ]] && [[ "$C_TEST_CMD" == *make*test* ]]; then
 else
   bash -lc "$C_TEST_CMD" 2>&1 | tee /w/test-patch.log || true
 fi
-python3 /w/empty_junit_if_missing.py /w/junit-patch.xml /w/test-patch.log
 """
+        + ctest_junit_tail_patch
         + (_pip_freeze_block() if run_pip_freeze else "")
     )
 
@@ -1355,7 +1672,7 @@ if _has_testcases(out):
     raise SystemExit(0)
 repo = Path(os.environ.get("REPO_DIR", "/testbed"))
 junit_dir = repo / "junit"
-if junit_dir.is_dir():
+if os.environ.get("SKIP_REPO_JUNIT_HARVEST", "") != "1" and junit_dir.is_dir():
     proc = subprocess.run(
         ["python3", "/w/harvest_jest_junit.py", str(out), str(junit_dir)],
         capture_output=True,
@@ -1459,7 +1776,7 @@ def write_entry_script(
         body = _js_body(install_config, run_pip_freeze, **body_kw)
         _write_generic_install_bundle(work, install_config, include_pip=False, repo_dir=repo_dir)
     elif lang.id == "php":
-        body = _php_body(run_pip_freeze, **body_kw)
+        body = _php_body(install_config, run_pip_freeze, **body_kw)
         _write_generic_install_bundle(work, install_config, include_pip=False, repo_dir=repo_dir)
     elif lang.id == "ruby":
         body = _ruby_body(run_pip_freeze, install_config, **body_kw)
