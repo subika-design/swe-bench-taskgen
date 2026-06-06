@@ -8,3 +8,4 @@ build/
 output/
 .pytest_cache/
 logs/
+output/
