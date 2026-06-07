@@ -266,6 +266,8 @@ def _junit_file_to_repo_relpath(rel_s: str, repo_root: Path) -> str:
             return rel.as_posix()
         except (ValueError, OSError):
             pass
+    while s.startswith("./"):
+        s = s[2:]
     return s.lstrip("/")
 
 
@@ -1096,6 +1098,32 @@ def junit_case_to_mocha_nodeid(
     return name
 
 
+def _rspec_junit_classname_is_dotted_spec_path(classname: str, rel_s: str) -> bool:
+    """
+    True when ``rspec_junit_formatter`` puts the spec file in ``classname``.
+
+    See ``swebench.harness.log_parsers.junit_xml`` — kept in sync for grading.
+    """
+    if not classname:
+        return False
+    if "::" in classname or " " in classname:
+        return False
+    cn = classname.replace("\\", ".").strip(".")
+    if not cn or "/" in cn:
+        return False
+
+    if rel_s:
+        rel_norm = rel_s.replace("\\", "/").lstrip("./")
+        dotted_rel = rel_norm.removesuffix(".rb").replace("/", ".")
+        stem = Path(rel_norm).stem
+        if cn == dotted_rel or cn == stem:
+            return True
+
+    if cn.startswith("spec.") and cn.endswith("_spec"):
+        return True
+    return False
+
+
 def junit_case_to_rspec_nodeid(
     case: ET.Element,
     repo_root: Path,
@@ -1113,6 +1141,8 @@ def junit_case_to_rspec_nodeid(
         if resolved:
             rel_s = resolved
     if rel_s:
+        if name and _rspec_junit_classname_is_dotted_spec_path(classname, rel_s):
+            return f"{rel_s}::{name}"
         if classname and name and classname != name and not classname.startswith(rel_s):
             return f"{rel_s}::{classname} {name}".strip()
         if name:

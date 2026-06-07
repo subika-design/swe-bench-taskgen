@@ -56,6 +56,35 @@ def test_rspec_junit_nodeid_uses_spec_file(tmp_path: Path):
     assert pa == 1
 
 
+def test_rspec_junit_nodeid_rspec_junit_formatter_file_on_testcase(tmp_path: Path):
+    """Regression: dotted classname + full example in name (RuboCop eval logs)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    spec = repo / "spec" / "rubocop" / "version_spec.rb"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("RSpec.describe 'x' do\nend\n", encoding="utf-8")
+
+    junit = tmp_path / "junit.xml"
+    junit.write_text(
+        """<?xml version="1.0"?>
+<testsuite name="rspec" tests="1">
+  <testcase classname="spec.rubocop.version_spec"
+            name="RuboCop::Version.rubydex_indicator when UseProjectIndex is false is expected to eq &quot;&quot;"
+            file="./spec/rubocop/version_spec.rb"
+            time="0.04"/>
+</testsuite>""",
+        encoding="utf-8",
+    )
+
+    case_map = parse_junit(junit, repo, language="ruby")
+    assert len(case_map) == 1
+    nid = next(iter(case_map))
+    assert nid == (
+        "spec/rubocop/version_spec.rb::RuboCop::Version.rubydex_indicator "
+        'when UseProjectIndex is false is expected to eq ""'
+    )
+
+
 def test_rspec_junit_nodeid_matches_basename_alias():
     paths = ["spec/rubocop/cop/style/empty_literal_spec.rb"]
     assert rspec_junit_nodeid_in_test_patch_paths(
