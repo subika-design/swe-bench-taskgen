@@ -228,7 +228,13 @@ def heuristic_fix_install_config_from_harness_build(
     repo_id: str = "",
 ) -> dict[str, Any]:
     """Apply known fixes for common harness env/instance build failures."""
-    from .install_llm import merge_pre_install_debian_packages, sanitize_install_config_for_docker
+    from .apt_from_log import (
+        apt_packages_from_build_log,
+        remediate_missing_apt_packages_from_log,
+    )
+    from .install_llm import sanitize_install_config_for_docker
+
+    cfg = remediate_missing_apt_packages_from_log(dict(install_config), build_log)
 
     low = (build_log or "").lower()
     deb: list[str] = []
@@ -241,24 +247,16 @@ def heuristic_fix_install_config_from_harness_build(
     if "psycopg2" in low or "psycopg" in low:
         deb.append("libpq-dev")
 
-    from .apt_from_log import apt_packages_from_build_log
-
     deb.extend(apt_packages_from_build_log(build_log))
 
-    if not deb:
+    if not deb and cfg == install_config:
         return install_config
 
-    cfg = sanitize_install_config_for_docker(dict(install_config), repo_id or "")
-    # Apply after sanitize (django baseline merge can reset pre_install).
-    pre = list(cfg.get("pre_install") or [])
-    cfg["pre_install"] = merge_pre_install_debian_packages(pre, deb)
-    apt = list(cfg.get("apt-pkgs") or [])
-    seen = set(apt)
-    for pkg in deb:
-        if pkg not in seen:
-            seen.add(pkg)
-            apt.append(pkg)
-    cfg["apt-pkgs"] = apt
+    cfg = sanitize_install_config_for_docker(cfg, repo_id or "")
+    from .apt_from_log import merge_apt_into_config
+
+    if deb:
+        cfg = merge_apt_into_config(cfg, deb)
     return cfg
 
 

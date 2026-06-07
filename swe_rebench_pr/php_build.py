@@ -12,6 +12,26 @@ from .apt_from_log import ensure_base_build_apt, merge_apt_into_config, remediat
 DEFAULT_PHP_VERSION = "8.2-cli-bookworm"
 
 _PHP_APT_BASE = ("unzip", "libzip-dev", "libxml2-dev", "libcurl4-openssl-dev", "libicu-dev")
+_PHP_EXT_INSTALL_RE = re.compile(r"\bdocker-php-ext-install\b")
+_PHPUNIT_BIN_RE = re.compile(
+    r"""([\w./-]*(?:vendor/bin/|bin/)(?:phpunit|simple-phpunit|pest))\b""",
+    re.I,
+)
+_PHPUNIT_MISSING_RE = re.compile(
+    r"""(?:vendor/bin/|tools/[\w-]+/bin/|vendor-bin/[\w-]+/bin/)phpunit(?:['":\s]|$).*?(?:no such file|not found|cannot find)""",
+    re.I,
+)
+_MAKEFILE_PHPUNIT_RE = re.compile(r"^PHPUNIT\s*=\s*(.+)$", re.MULTILINE | re.I)
+_PHPUNIT_GLOB_PATTERNS = (
+    "tools/*/bin/phpunit",
+    "tools/*/bin/simple-phpunit",
+    "vendor-bin/*/bin/phpunit",
+    "vendor-bin/*/bin/simple-phpunit",
+    "tools/*/vendor/bin/phpunit",
+    "tools/*/vendor/bin/simple-phpunit",
+    "vendor-bin/*/vendor/bin/phpunit",
+    "vendor-bin/*/vendor/bin/simple-phpunit",
+)
 _DOCKER_PHP_EXT_NAMES: dict[str, str] = {
     "intl": "intl",
     "zip": "zip",
@@ -85,6 +105,22 @@ def ensure_php_docker_specs(
     return out
 
 
+def ensure_php_pre_install_order(cfg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Run Debian packages before ``docker-php-ext-install`` (extensions need -dev libs).
+    """
+    pre = list(cfg.get("pre_install") or [])
+    if not pre:
+        return cfg
+    ext_lines = [ln for ln in pre if _PHP_EXT_INSTALL_RE.search(str(ln))]
+    if not ext_lines:
+        return cfg
+    other = [ln for ln in pre if ln not in ext_lines]
+    out = dict(cfg)
+    out["pre_install"] = other + ext_lines
+    return out
+
+
 def php_install_config_for_repo(
     repo: Path,
     *,
@@ -105,10 +141,12 @@ def php_install_config_for_repo(
     if pre:
         cfg["pre_install"] = pre
     cfg["install"] = "composer install --no-interaction --prefer-dist --no-progress"
-    runner, test_cmd = php_test_cmd_for_repo(repo)
+    from .ci_extract import ci_all_run_lines
+
+    runner, test_cmd = php_test_cmd_for_repo(repo, ci_runs=ci_all_run_lines(repo))
     cfg["php_test_runner"] = runner
     cfg["test_cmd"] = test_cmd
-    return cfg
+    return ensure_php_pre_install_order(cfg)
 
 
 def _composer_json(repo: Path) -> dict[str, Any] | None:
@@ -198,30 +236,234 @@ def php_docker_ext_install_cmd(repo: Path, *, ci_extensions: Iterable[str] | Non
     return php_docker_ext_install_cmd_for_extensions(to_install)
 
 
-def php_test_cmd_for_repo(repo: Path) -> tuple[str, str]:
+def _composer_json_declares_bamarni_bin(data: dict[str, Any]) -> bool:
+    for section in ("require-dev", "require"):
+        block = data.get(section) or {}
+        if isinstance(block, dict) and block.get("bamarni/composer-bin-plugin"):
+            return True
+    plugins = data.get("config") or {}
+    if isinstance(plugins, dict):
+        allow = plugins.get("allow-plugins") or {}
+        if isinstance(allow, dict) and allow.get("bamarni/composer-bin-plugin"):
+            return True
+    return False
+
+
+def repo_uses_composer_bin_plugin(repo: Path) -> bool:
+    """True when Composer uses bamarni/composer-bin-plugin (tools in subdirs)."""
+    data = _composer_json(repo)
+    if data and _composer_json_declares_bamarni_bin(data):
+        return True
+    return (repo / "vendor-bin").is_dir() or (repo / "tools").is_dir()
+
+
+def bamarni_bin_target_directory(repo: Path) -> str:
+    """``extra.bamarni-bin.target-directory`` (default ``vendor-bin``)."""
+    data = _composer_json(repo)
+    if not data:
+        return "vendor-bin"
+    extra = data.get("extra") or {}
+    bamarni = extra.get("bamarni-bin") if isinstance(extra, dict) else {}
+    if isinstance(bamarni, dict):
+        target = str(bamarni.get("target-directory") or "").strip().strip("/")
+        if target:
+            return target
+    return "vendor-bin"
+
+
+def bamarni_bin_links_enabled(repo: Path) -> bool:
+    data = _composer_json(repo)
+    if not data:
+        return True
+    extra = data.get("extra") or {}
+    bamarni = extra.get("bamarni-bin") if isinstance(extra, dict) else {}
+    if isinstance(bamarni, dict) and "bin-links" in bamarni:
+        return bool(bamarni.get("bin-links"))
+    return True
+
+
+def inferred_composer_bin_phpunit_rel(repo: Path, *, namespace: str = "phpunit") -> str | None:
+    """
+    Infer bamarni composer-bin PHPUnit path from ``composer.json`` (no install required).
+
+    ``bin-links: false`` → ``{target}/phpunit/bin/phpunit``;
+    ``bin-links: true`` → ``{target}/phpunit/vendor/bin/phpunit``.
+    """
+    data = _composer_json(repo)
+    if not data or not _composer_json_declares_bamarni_bin(data):
+        return None
+    target = bamarni_bin_target_directory(repo)
+    ns = namespace.strip().strip("/") or "phpunit"
+    if bamarni_bin_links_enabled(repo):
+        return f"{target}/{ns}/vendor/bin/phpunit"
+    return f"{target}/{ns}/bin/phpunit"
+
+
+def _normalize_phpunit_bin_rel(raw: str) -> str:
+    rel = raw.strip().strip('"').strip("'").lstrip("./")
+    return rel.replace("\\", "/")
+
+
+def _glob_phpunit_bins(repo: Path) -> list[Path]:
+    hits: list[Path] = []
+    seen: set[str] = set()
+    for pattern in _PHPUNIT_GLOB_PATTERNS:
+        for p in repo.glob(pattern):
+            if not p.is_file():
+                continue
+            key = p.relative_to(repo).as_posix()
+            if key not in seen:
+                seen.add(key)
+                hits.append(p)
+    hits.sort(key=lambda p: (len(p.parts), str(p)))
+    return hits
+
+
+def discover_phpunit_bin_from_makefile(repo: Path) -> tuple[str, str] | None:
+    """
+    Parse ``PHPUNIT = ...`` from Makefile-style files.
+
+    Returns ``(bin_rel, extra_args)`` e.g. ``("tools/phpunit/bin/phpunit", "-c .")``.
+    """
+    for name in ("Makefile", "GNUmakefile", "makefile"):
+        mf = repo / name
+        if not mf.is_file():
+            continue
+        try:
+            text = mf.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        m = _MAKEFILE_PHPUNIT_RE.search(text)
+        if not m:
+            continue
+        raw = m.group(1).strip().split("#", 1)[0].strip()
+        if not raw:
+            continue
+        parts = raw.split()
+        if not parts:
+            continue
+        bin_rel = _normalize_phpunit_bin_rel(parts[0])
+        if not bin_rel.endswith(("phpunit", "simple-phpunit", "pest")):
+            continue
+        extra = " ".join(parts[1:])
+        if (repo / bin_rel).is_file() or "/" in bin_rel:
+            return bin_rel, extra
+    return None
+
+
+def discover_phpunit_bin_rel(repo: Path, *, ci_runs: Iterable[str] | None = None) -> str | None:
+    """
+    Locate PHPUnit (or simple-phpunit / pest) relative to repo root.
+
+    Handles composer-bin layouts like ``tools/phpunit/bin/phpunit`` and
+    ``tools/phpunit/vendor/bin/phpunit``.
+    """
+    root_phpunit = repo / "vendor" / "bin" / "phpunit"
+    if root_phpunit.is_file():
+        return "vendor/bin/phpunit"
+    root_simple = repo / "vendor" / "bin" / "simple-phpunit"
+    if root_simple.is_file():
+        return "vendor/bin/simple-phpunit"
+
+    makefile = discover_phpunit_bin_from_makefile(repo)
+    if makefile:
+        return makefile[0]
+
+    hits = _glob_phpunit_bins(repo)
+    if hits:
+        return hits[0].relative_to(repo).as_posix()
+
+    data = _composer_json(repo)
+    if data:
+        scripts = data.get("scripts") or {}
+        if isinstance(scripts, dict):
+            for raw in scripts.values():
+                text = (
+                    raw
+                    if isinstance(raw, str)
+                    else " ".join(str(x) for x in raw)
+                    if isinstance(raw, list)
+                    else json.dumps(raw)
+                )
+                m = _PHPUNIT_BIN_RE.search(text)
+                if m:
+                    rel = _normalize_phpunit_bin_rel(m.group(1))
+                    if (repo / rel).is_file():
+                        return rel
+
+    inferred = inferred_composer_bin_phpunit_rel(repo)
+    if inferred:
+        return inferred
+
+    for line in ci_runs or []:
+        m = _PHPUNIT_BIN_RE.search(str(line))
+        if m:
+            rel = _normalize_phpunit_bin_rel(m.group(1))
+            if (repo / rel).is_file():
+                return rel
+
+    return None
+
+
+def discover_phpunit_invocation(
+    repo: Path,
+    *,
+    ci_runs: Iterable[str] | None = None,
+) -> tuple[str, str] | None:
+    """Return ``(bin_rel, extra_args)`` for PHPUnit invocation."""
+    makefile = discover_phpunit_bin_from_makefile(repo)
+    if makefile:
+        return makefile
+    rel = discover_phpunit_bin_rel(repo, ci_runs=ci_runs)
+    if rel:
+        return rel, ""
+    return None
+
+
+def php_test_cmd_with_bin(bin_rel: str, *, extra_args: str = "") -> str:
+    flags = str(extra_args or "").strip()
+    if flags:
+        return f"{bin_rel} {flags} --log-junit __JUNIT_OUT__"
+    return f"{bin_rel} --log-junit __JUNIT_OUT__"
+
+
+def php_test_cmd_for_repo(
+    repo: Path,
+    *,
+    ci_runs: Iterable[str] | None = None,
+) -> tuple[str, str]:
     """
     Return ``(php_test_runner, test_cmd)`` with ``__JUNIT_OUT__`` placeholder.
 
-    Prefers Symfony ``simple-phpunit``, then Laravel ``artisan test``, then ``phpunit``.
+    Prefers Symfony ``simple-phpunit``, then Laravel ``artisan test``, then discovered phpunit.
     """
     from .repo_detect import repo_uses_artisan_phpunit
 
     if repo_uses_artisan_phpunit(repo):
+        discovered = discover_phpunit_bin_rel(repo, ci_runs=ci_runs) or "vendor/bin/phpunit"
         return (
             "artisan",
             "php artisan test --log-junit __JUNIT_OUT__ 2>/dev/null "
-            "|| vendor/bin/phpunit --log-junit __JUNIT_OUT__",
+            f"|| {php_test_cmd_with_bin(discovered)}",
         )
     if repo_uses_symfony_phpunit_bridge(repo):
+        bin_rel = discover_phpunit_bin_rel(repo, ci_runs=ci_runs) or "vendor/bin/simple-phpunit"
+        if "simple-phpunit" not in bin_rel:
+            bin_rel = "vendor/bin/simple-phpunit"
         return (
             "simple-phpunit",
-            "vendor/bin/simple-phpunit --log-junit __JUNIT_OUT__ 2>/dev/null "
-            "|| vendor/bin/simple-phpunit --log-junit __JUNIT_OUT__",
+            f"{bin_rel} --log-junit __JUNIT_OUT__ 2>/dev/null "
+            f"|| {bin_rel} --log-junit __JUNIT_OUT__",
         )
+    invocation = discover_phpunit_invocation(repo, ci_runs=ci_runs)
+    if invocation:
+        bin_rel, extra = invocation
+    else:
+        bin_rel, extra = "vendor/bin/phpunit", ""
+    cmd = php_test_cmd_with_bin(bin_rel, extra_args=extra)
     return (
         "phpunit",
-        "vendor/bin/phpunit --log-junit __JUNIT_OUT__ 2>/dev/null "
-        "|| vendor/bin/phpunit --log-junit __JUNIT_OUT__",
+        f"{cmd} 2>/dev/null || {cmd}",
     )
 
 
@@ -288,14 +530,75 @@ def php_junit_nodeid_in_test_patch_paths(nodeid: str, paths: list[str]) -> bool:
     return False
 
 
+def log_indicates_php_phpunit_missing(log: str) -> bool:
+    low = (log or "").lower()
+    if _PHPUNIT_MISSING_RE.search(log or ""):
+        return True
+    if "phpunit" not in low:
+        return False
+    return any(
+        tok in low
+        for tok in ("no such file", "not found", "cannot find", "no such file or directory")
+    )
+
+
+def phpunit_bin_from_test_cmd(test_cmd: str) -> str | None:
+    """First PHPUnit executable token from ``test_cmd``."""
+    raw = str(test_cmd or "").strip()
+    if not raw:
+        return None
+    head = raw.split("||", 1)[0].strip()
+    head = re.split(r"\s2>/dev/null\b", head, maxsplit=1)[0].strip()
+    first = head.split()[0] if head.split() else ""
+    first = _normalize_phpunit_bin_rel(first)
+    if first.endswith(("phpunit", "simple-phpunit", "pest")):
+        return first
+    return None
+
+
+def php_runtime_deps_present_check_shell(repo_dir: str) -> str:
+    """Bash guard: true when a PHPUnit binary appears present under *repo_dir*."""
+    qrepo = repo_dir if repo_dir.startswith("/") else f'"{repo_dir}"'
+    return f"""\
+  if [[ -x {qrepo}/vendor/bin/phpunit ]] || [[ -x {qrepo}/vendor/bin/simple-phpunit ]]; then
+    return 0
+  fi
+  if compgen -G {qrepo}/tools/*/bin/phpunit >/dev/null 2>&1 \\
+     || compgen -G {qrepo}/tools/*/bin/simple-phpunit >/dev/null 2>&1 \\
+     || compgen -G {qrepo}/vendor-bin/*/bin/phpunit >/dev/null 2>&1 \\
+     || compgen -G {qrepo}/vendor-bin/*/bin/simple-phpunit >/dev/null 2>&1; then
+    return 0
+  fi
+  if find {qrepo} -path '*/vendor/bin/phpunit' -executable 2>/dev/null | head -1 | grep -q .; then
+    return 0
+  fi
+  if find {qrepo} \\( -path '*/tools/*/bin/phpunit' -o -path '*/vendor-bin/*/bin/phpunit' \\) \\
+     -executable 2>/dev/null | head -1 | grep -q .; then
+    return 0
+  fi"""
+
+
 def remediate_php_install_from_log(cfg: dict[str, Any], log: str, *, repo: Path | None = None) -> dict[str, Any]:
     out = remediate_apt_install_from_log(cfg, log)
     out = merge_apt_into_config(out, list(_PHP_APT_BASE))
     if repo is not None:
+        from .ci_extract import ci_all_run_lines
         from .manifest_extract import composer_ext_apt_packages
 
         out = merge_apt_into_config(out, composer_ext_apt_packages(repo))
-        runner, test_cmd = php_test_cmd_for_repo(repo)
+        ci_runs = ci_all_run_lines(repo)
+        runner, test_cmd = php_test_cmd_for_repo(repo, ci_runs=ci_runs)
+        if log_indicates_php_phpunit_missing(log):
+            invocation = discover_phpunit_invocation(repo, ci_runs=ci_runs)
+            if invocation:
+                discovered, extra = invocation
+                runner = (
+                    "simple-phpunit"
+                    if "simple-phpunit" in discovered
+                    else "phpunit"
+                )
+                cmd = php_test_cmd_with_bin(discovered, extra_args=extra)
+                test_cmd = f"{cmd} 2>/dev/null || {cmd}"
         out["php_test_runner"] = runner
         out["test_cmd"] = test_cmd
         out["install"] = "composer install --no-interaction --prefer-dist --no-progress"
@@ -305,7 +608,7 @@ def remediate_php_install_from_log(cfg: dict[str, Any], log: str, *, repo: Path 
             if ext_cmd not in pre:
                 pre.append(ext_cmd)
             out["pre_install"] = pre
-    return out
+    return ensure_php_pre_install_order(out)
 
 
 def repo_has_bin_composer(repo: Path) -> bool:

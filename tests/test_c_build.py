@@ -49,13 +49,15 @@ def test_remediate_c_install_from_log_merges_pre_install():
     out = remediate_c_install_from_log(cfg, log)
     pre = " ".join(out.get("pre_install") or [])
     assert "libuuid-dev" in pre
-    assert "libuuid-dev" in (out.get("apt-pkgs") or [])
+    apt = (out.get("apt-pkgs") or []) + (out.get("apt-pkgs-optional") or [])
+    assert "libuuid-dev" in apt
 
 
 def test_merge_c_apt_into_config_deduplicates():
     cfg = {"pre_install": ["apt-get update -qq", "apt-get install -y git build-essential"]}
     out = merge_c_apt_into_config(cfg, ["libuuid-dev", "libuuid-dev"])
-    assert (out.get("apt-pkgs") or []).count("libuuid-dev") == 1
+    apt = (out.get("apt-pkgs") or []) + (out.get("apt-pkgs-optional") or [])
+    assert apt.count("libuuid-dev") == 1
 
 
 def test_merge_c_harness_fields_after_llm_keeps_c_test_cmd():
@@ -102,5 +104,6 @@ def test_ensure_c_install_config_premake_repo(tmp_path: Path):
     out = ensure_c_install_config({}, repo=tmp_path, test_paths=["tests/base/test_os.lua"])
     assert out.get("c_build_system") == "premake"
     assert "Bootstrap.sh" in out["install"]
-    assert "uuid-dev" in (out.get("apt-pkgs") or [])
+    apt = (out.get("apt-pkgs") or []) + (out.get("apt-pkgs-optional") or [])
+    assert "uuid-dev" in apt
     assert "cmake" not in " ".join(out.get("pre_install") or [])

@@ -19,6 +19,7 @@ class HarnessKind(str, Enum):
     NATIVE_PYTEST = "native_pytest"
     CTEST = "ctest"
     PREMAKE = "premake"
+    MESON = "meson"
 
 
 HARNESS_FLAG_KEYS: tuple[str, ...] = (
@@ -59,7 +60,7 @@ def resolve_c_harness_kind(
 
     Priority: runtests (libtest) > native nested pytest > plain ctest > premake.
     """
-    from .c_build import is_premake_repo
+    from .c_build import is_meson_repo, is_premake_repo
 
     if is_premake_repo(repo):
         return HarnessKind.PREMAKE
@@ -72,6 +73,8 @@ def resolve_c_harness_kind(
     )
     if runner and repo_has_cmake_integration(repo, test_paths=runner):
         return HarnessKind.NATIVE_PYTEST
+    if is_meson_repo(repo):
+        return HarnessKind.MESON
     if (repo / "CMakeLists.txt").is_file():
         return HarnessKind.CTEST
     return HarnessKind.CTEST
@@ -127,6 +130,10 @@ def apply_c_harness_router(
         return ensure_c_install_config(
             out, repo=repo, test_paths=test_paths, test_patch=test_patch
         )
+    if kind == HarnessKind.MESON:
+        from .c_build import meson_install_config_for_repo
+
+        return meson_install_config_for_repo(repo, base=out)
     out = clear_all_harness_flags(out)
     if kind == HarnessKind.RUNTESTS:
         nums = collect_runtests_numbers(test_patch)
@@ -156,8 +163,10 @@ def c_harness_runner_label(cfg: dict[str, Any]) -> str:
         return "pytest (native integration)"
     if cfg.get("cmake_runtests_build"):
         return "runtests.pl"
-    from .c_build import is_premake_config
+    from .c_build import is_meson_config, is_premake_config
 
     if is_premake_config(cfg):
         return "premake5 test"
+    if is_meson_config(cfg):
+        return "meson test"
     return str(cfg.get("c_build_system") or "cmake")

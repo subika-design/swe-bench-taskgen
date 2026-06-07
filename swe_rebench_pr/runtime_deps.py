@@ -54,13 +54,14 @@ _restore_runtime_deps_if_needed
 """
 
     if lang == "php":
+        from .php_build import php_runtime_deps_present_check_shell
+
         cmd = install if install and install != "true" else "composer install --no-interaction --prefer-dist || true"
+        present = php_runtime_deps_present_check_shell(qrepo)
         return f"""
 _restore_runtime_deps_if_needed() {{
-  if [[ -x {qrepo}/vendor/bin/phpunit ]] || [[ -x {qrepo}/vendor/bin/simple-phpunit ]]; then
-    return 0
-  fi
-  echo "[docker] vendor/bin/phpunit missing after reset; re-running install" >&2
+{present}
+  echo "[docker] phpunit binary missing after reset; re-running install" >&2
   (cd {qrepo} && {cmd}) || true
 }}
 _restore_runtime_deps_if_needed

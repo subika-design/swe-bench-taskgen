@@ -31,6 +31,7 @@ def test_normalize_gradlew_build_not_chmod_only():
     assert "chmod +x ./gradlew" in out
     assert "./gradlew" in out
     assert "build" in out
+    assert "-x check" in out
     assert out.count("chmod +x ./gradlew") == 1
 
 

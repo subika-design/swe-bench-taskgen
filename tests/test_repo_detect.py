@@ -36,6 +36,11 @@ def test_repo_uses_meson_python_backend(tmp_path: Path):
     assert repo_uses_meson_python_backend(tmp_path)
 
 
+def test_meson_build_alone_is_not_meson_python_backend(tmp_path: Path):
+    (tmp_path / "meson.build").write_text("project('mpv', 'c')\n", encoding="utf-8")
+    assert not repo_uses_meson_python_backend(tmp_path)
+
+
 def test_repo_needs_dateutil_zoneinfo(tmp_path: Path):
     (tmp_path / "updatezinfo.py").write_text("#\n", encoding="utf-8")
     (tmp_path / "zonefile_metadata.json").write_text("{}", encoding="utf-8")

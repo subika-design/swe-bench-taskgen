@@ -8,8 +8,11 @@ RUN apt update && apt install -y \
     wget \
     git \
     build-essential \
+    pkg-config \
     libgd-dev \
     libzip-dev \
+    libxml2-dev \
+    libicu-dev \
     libgmp-dev \
     libftp-dev \
     libcurl4-openssl-dev \

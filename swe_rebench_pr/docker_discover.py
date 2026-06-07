@@ -1336,6 +1336,21 @@ def discover_fail_to_pass_pass_to_pass_docker(
         print("  docker not in PATH; skip docker discover", file=sys.stderr)
         return [], [], ""
 
+    from .docker_runtime import (
+        docker_daemon_available,
+        docker_daemon_error_message,
+        is_docker_daemon_unavailable_error,
+    )
+
+    daemon_ok, daemon_reason = docker_daemon_available()
+    if not daemon_ok:
+        print(
+            f"  {pr.instance_id}: skip docker discover — "
+            f"{docker_daemon_error_message(daemon_reason)}",
+            file=sys.stderr,
+        )
+        return [], [], ""
+
     lang = normalize_language(language)
     patch = str(row.get("patch") or "")
     test_patch = str(row.get("test_patch") or "")
@@ -1609,6 +1624,8 @@ def discover_fail_to_pass_pass_to_pass_docker(
                 llm=llm_remediate,
                 repo_id=str(row.get("repo") or pr.repo_id),
                 instance_id=pr.instance_id,
+                patch=patch,
+                test_patch=test_patch,
             )
             print(
                 f"  {pr.instance_id}: java build_system={eff_cfg.get('java_build_system')} "
@@ -1870,7 +1887,11 @@ def discover_fail_to_pass_pass_to_pass_docker(
             )
             gradle_module_mismatch = False
             if lang == "java":
-                from .java_build import log_indicates_gradle_module_slice_mismatch
+                from .java_build import (
+                    extract_gradle_projects_output_from_log,
+                    log_indicates_gradle_module_slice_mismatch,
+                    log_indicates_gradle_project_not_found,
+                )
                 from .harness_guards import log_indicates_gradle_no_tests_found_for_includes
 
                 gradle_module_mismatch = (
@@ -1880,10 +1901,14 @@ def discover_fail_to_pass_pass_to_pass_docker(
                         tp_tot=last_tp_tot,
                     )
                     or test_target_failed
+                    or log_indicates_gradle_project_not_found(log_tail)
                     or log_indicates_gradle_no_tests_found_for_includes(
                         log_tail, n_patch=last_n_patch
                     )
                 )
+                gradle_projects_log = extract_gradle_projects_output_from_log(log_tail)
+            else:
+                gradle_projects_log = ""
             after_patch_empty = bool(last_metrics.get("after_patch_empty"))
             patch_apply_failed = bool(last_metrics.get("patch_apply_failed"))
             patch_junit_ok = (
@@ -2125,6 +2150,9 @@ def discover_fail_to_pass_pass_to_pass_docker(
                         llm=None,
                         repo_id=str(row.get("repo") or pr.repo_id),
                         instance_id=pr.instance_id,
+                        patch=patch,
+                        test_patch=test_patch,
+                        gradle_projects_output=gradle_projects_log,
                     )
                     heuristic_cfg = _docker_install_config_effective(
                         heuristic_cfg, pr, repo=repo
@@ -2161,6 +2189,9 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     llm=None,
                     repo_id=str(row.get("repo") or pr.repo_id),
                     instance_id=pr.instance_id,
+                    patch=patch,
+                    test_patch=test_patch,
+                    gradle_projects_output=gradle_projects_log,
                 )
                 heuristic_cfg = _docker_install_config_effective(
                     heuristic_cfg, pr, repo=repo
@@ -2231,6 +2262,9 @@ def discover_fail_to_pass_pass_to_pass_docker(
                     llm=java_llm,
                     repo_id=str(row.get("repo") or pr.repo_id),
                     instance_id=pr.instance_id,
+                    patch=patch,
+                    test_patch=test_patch,
+                    gradle_projects_output=gradle_projects_log,
                 )
                 heuristic_cfg = _docker_install_config_effective(heuristic_cfg, pr, repo=repo)
                 if not install_config_remediation_unchanged(eff_cfg, heuristic_cfg):
@@ -2601,6 +2635,9 @@ def discover_fail_to_pass_pass_to_pass_docker(
                         llm=None if build_failed else llm_remediate,
                         repo_id=str(row.get("repo") or pr.repo_id),
                         instance_id=pr.instance_id,
+                        patch=patch,
+                        test_patch=test_patch,
+                        gradle_projects_output=gradle_projects_log,
                     )
                 row["install_config"] = export_install_config_for_harness(eff_cfg)
             except Exception as ex:
@@ -2942,6 +2979,8 @@ def discover_fail_to_pass_pass_to_pass_docker(
                         llm=llm_remediate,
                         repo_id=str(row.get("repo") or pr.repo_id),
                         instance_id=pr.instance_id,
+                        patch=patch,
+                        test_patch=test_patch,
                     )
                 row["install_config"] = export_install_config_for_harness(eff_cfg)
                 use_tests_only = setup_ready and not last_install_failed
@@ -3035,7 +3074,15 @@ def discover_fail_to_pass_pass_to_pass_docker(
         )
         return f2p, p2p, task_type
     except Exception as e:
-        print(f"  {pr.instance_id}: docker discover error: {e}", file=sys.stderr)
+        if is_docker_daemon_unavailable_error(e):
+            docker_daemon_available(refresh=True)
+            print(
+                f"  {pr.instance_id}: skip docker discover — "
+                f"{docker_daemon_error_message(str(e))}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"  {pr.instance_id}: docker discover error: {e}", file=sys.stderr)
         return [], [], ""
     finally:
         shutil.rmtree(work, ignore_errors=True)

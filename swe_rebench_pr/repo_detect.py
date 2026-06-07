@@ -52,13 +52,16 @@ def uses_django_runtests(*, repo: Path | None = None, repo_id: str | None = None
 
 
 def repo_uses_meson_python_backend(repo: Path) -> bool:
-    """True when the project builds via meson-python (e.g. pandas), not plain setuptools."""
+    """True when the project builds via meson-python (e.g. pandas), not native C Meson."""
     ppt = repo / "pyproject.toml"
-    if ppt.is_file():
-        text = _read_repo_text(ppt).lower()
-        if "meson-python" in text or "mesonpython" in text or 'build-backend = "meson' in text:
-            return True
-    return (repo / "meson.build").is_file()
+    if not ppt.is_file():
+        return False
+    text = _read_repo_text(ppt).lower()
+    return (
+        "meson-python" in text
+        or "mesonpython" in text
+        or 'build-backend = "meson' in text
+    )
 
 
 def repo_needs_dateutil_zoneinfo(repo: Path) -> bool:

@@ -79,6 +79,8 @@ def build_install_config_for_repo(
             llm=llm_install,
             repo_id=repo_id,
             instance_id=instance_id,
+            patch=patch,
+            test_patch=test_patch,
         )
     elif lang == "javascript" and test_paths:
         from .js_build import merge_js_build_into_config

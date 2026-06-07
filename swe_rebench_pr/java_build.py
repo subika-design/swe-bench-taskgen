@@ -689,6 +689,9 @@ def merge_java_build_into_config(
     llm: tuple[str, str, str, int] | None = None,
     repo_id: str = "",
     instance_id: str = "",
+    patch: str = "",
+    test_patch: str = "",
+    gradle_projects_output: str = "",
 ) -> dict[str, Any]:
     """Enrich Java install_config with Gradle or Maven heuristics from test paths."""
     bs = detect_java_build_system(repo)
@@ -727,6 +730,9 @@ def merge_java_build_into_config(
             timeout_s=llm[3] if llm else 120,
             repo_id=repo_id,
             instance_id=instance_id,
+            patch=patch,
+            test_patch=test_patch,
+            gradle_projects_output=gradle_projects_output,
         )
     hinted = java_install_config_for_repo(
         repo,
@@ -876,7 +882,7 @@ def merge_java_harness_fields_after_llm(before: dict[str, Any], after: dict[str,
 def repair_gradle_install_config_for_harness(cfg: dict[str, Any]) -> dict[str, Any]:
     """
     Normalize Gradle commands for SWE-bench grading: no ``-q``, test logging init,
-    and ``--configure-on-demand`` to avoid configuring unrelated subprojects.
+    ``--configure-on-demand``, and skip lint/check tasks during compile install.
     """
     test_cmd_hint = str(cfg.get("test_cmd") or "")
     is_gradle = (
@@ -891,6 +897,19 @@ def repair_gradle_install_config_for_harness(cfg: dict[str, Any]) -> dict[str, A
     if not any("swebench-harness-logging.init.gradle" in str(x) for x in pre):
         pre = [*pre, init_cmd] if pre else [init_cmd]
     out["pre_install"] = pre
+
+    def _ensure_gradle_install_skips_lint(cmd: str) -> str:
+        s = (cmd or "").strip()
+        if not s or "./gradlew" not in s:
+            return s
+        low = s.lower()
+        if "build" not in low and "assemble" not in low:
+            return s
+        if "-x check" in low:
+            return s
+        if "-x test" in low:
+            return re.sub(r"(-x\s+test\b)", r"\1 -x check", s, count=1)
+        return s.replace("./gradlew", "./gradlew -x test -x check", 1)
 
     def _fix_cmd(cmd: str) -> str:
         s = (cmd or "").strip()
@@ -917,6 +936,9 @@ def repair_gradle_install_config_for_harness(cfg: dict[str, Any]) -> dict[str, A
     tc = str(out.get("test_cmd") or "")
     if tc and is_valid_java_test_cmd(tc, out):
         out["test_cmd"] = _fix_cmd(tc)
+    inst = str(out.get("install") or "")
+    if inst and "./gradlew" in inst:
+        out["install"] = _ensure_gradle_install_skips_lint(inst)
     post = out.get("post_install")
     if isinstance(post, list):
         out["post_install"] = [_fix_cmd(str(x)) for x in post]
@@ -942,6 +964,18 @@ def log_indicates_gradle_module_slice_mismatch(
 ) -> bool:
     """JUnit ran (often wrong module) but zero cases matched ``test_patch`` paths."""
     return n_base > 0 and n_patch == 0 and tp_tot == 0
+
+
+def log_indicates_gradle_project_not_found(log_tail: str) -> bool:
+    low = (log_tail or "").lower()
+    return "project '" in low and "not found" in low and "gradle" in low
+
+
+def extract_gradle_projects_output_from_log(log_tail: str) -> str:
+    """Return ``./gradlew projects`` section from discover logs when present."""
+    if "Project '" not in (log_tail or ""):
+        return ""
+    return log_tail or ""
 
 
 def log_indicates_maven_missing_project(log_tail: str) -> bool:

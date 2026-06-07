@@ -32,7 +32,12 @@ def merge_pre_install_debian_packages(pre_install: list[str], deb_packages: list
     """Ensure ``pre_install`` installs *deb_packages* via apt (merge into existing install line)."""
     if not deb_packages:
         return pre_install
-    from .apt_from_log import sanitize_apt_package_names
+    from .apt_from_log import (
+        _extract_apt_packages_from_pre_install,
+        _is_apt_install_shell_line,
+        resilient_apt_install_shell_lines,
+        sanitize_apt_package_names,
+    )
     from .integration_build import filter_http3_apt_for_harness
 
     deb_packages = filter_http3_apt_for_harness(sanitize_apt_package_names(deb_packages))
@@ -42,60 +47,15 @@ def merge_pre_install_debian_packages(pre_install: list[str], deb_packages: list
     pre = list(pre_install)
     want: list[str] = []
     seen: set[str] = set()
-    for pkg in ("git", "build-essential", *deb_packages):
+    for pkg in ("git", "build-essential", *_extract_apt_packages_from_pre_install(pre), *deb_packages):
         if pkg not in seen:
             seen.add(pkg)
             want.append(pkg)
 
-    merged = False
-    new_pre: list[str] = []
-    for ln in pre:
-        stripped = ln.strip()
-        combined_update = _APT_UPDATE_INSTALL_LINE.match(stripped)
-        if combined_update and not merged:
-            existing = combined_update.group(2).split()
-            combined: list[str] = []
-            cseen: set[str] = set()
-            for p in existing + want:
-                if p not in cseen:
-                    cseen.add(p)
-                    combined.append(p)
-            update_prefix = combined_update.group(1)
-            new_pre.append(
-                f"{update_prefix} && apt-get install -y --no-install-recommends {' '.join(combined)}"
-            )
-            merged = True
-            continue
-        m = _APT_INSTALL_LINE.match(stripped)
-        if m and not merged:
-            existing = m.group(1).split()
-            combined = []
-            cseen = set()
-            for p in existing + want:
-                if p not in cseen:
-                    cseen.add(p)
-                    combined.append(p)
-            prefix = (
-                "apt-get install -y --no-install-recommends"
-                if "--no-install-recommends" in stripped
-                else "apt-get install -y"
-            )
-            update_prefix = "apt-get update -qq"
-            if not any("apt-get update" in x for x in new_pre):
-                new_pre.append(
-                    f"{update_prefix} && {prefix} {' '.join(combined)}"
-                )
-            else:
-                new_pre.append(f"{prefix} {' '.join(combined)}")
-            merged = True
-        else:
-            new_pre.append(ln)
-
-    if not merged:
-        new_pre.append(
-            f"apt-get update -qq && apt-get install -y --no-install-recommends {' '.join(want)}"
-        )
-    return new_pre
+    non_apt = [ln for ln in pre if not _is_apt_install_shell_line(ln)]
+    has_update = any("apt-get update" in str(ln).lower() for ln in non_apt)
+    apt_lines = resilient_apt_install_shell_lines(want, include_update=not has_update)
+    return non_apt + apt_lines
 
 # Mirrors ``tests/runtests.py`` ``ALWAYS_INSTALLED_APPS`` + per-target test modules.
 _DJANGO_CONTRIB_INSTALLED_APPS = [
@@ -319,9 +279,14 @@ def sanitize_install_config_for_docker(
         out[key] = [str(x).strip() for x in val if isinstance(x, str) and x.strip() and not bad(x)]
 
     install = str(out.get("install") or "pip install -e .").strip()
+    from .c_build import is_meson_repo
     from .repo_detect import repo_uses_meson_python_backend
 
-    meson_backend = repo is not None and repo_uses_meson_python_backend(repo)
+    meson_backend = (
+        repo is not None
+        and repo_uses_meson_python_backend(repo)
+        and not is_meson_repo(repo)
+    )
     if bad(install) or _BAD_PIP_EXTRA.search(install):
         if meson_backend:
             install = 'pip install -e ".[test,pyarrow]" --no-build-isolation'
@@ -736,19 +701,22 @@ def default_install_config_heuristic(repo: Path, language: str = "python") -> di
         from .js_build import js_install_config_for_repo
 
         return normalize_install_config(js_install_config_for_repo(repo, base=cfg))
-    elif lang == "c" and not (repo / "CMakeLists.txt").is_file():
-        cfg["install"] = "true"
     elif lang == "c":
-        from .c_build import ensure_c_install_config
+        from .c_build import ensure_c_install_config, is_meson_repo, meson_install_config_for_repo
 
-        cfg = ensure_c_install_config(cfg, repo=repo)
-        if repo is not None:
-            from .integration_build import apply_native_build_if_integration
+        if is_meson_repo(repo):
+            return normalize_install_config(meson_install_config_for_repo(repo, base=cfg))
+        if not (repo / "CMakeLists.txt").is_file():
+            cfg["install"] = "true"
+        else:
+            cfg = ensure_c_install_config(cfg, repo=repo)
+            if repo is not None:
+                from .integration_build import apply_native_build_if_integration
 
-            cfg = apply_native_build_if_integration(cfg, repo)
-            from .apt_from_log import sanitize_native_integration_apt_config
+                cfg = apply_native_build_if_integration(cfg, repo)
+                from .apt_from_log import sanitize_native_integration_apt_config
 
-            cfg = sanitize_native_integration_apt_config(cfg)
+                cfg = sanitize_native_integration_apt_config(cfg)
     elif lang == "ruby":
         from .ruby_build import ruby_install_config_for_repo
 

@@ -229,6 +229,13 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    if discover_docker:
+        from .docker_runtime import docker_daemon_available, docker_daemon_error_message
+
+        daemon_ok, daemon_reason = docker_daemon_available()
+        if not daemon_ok:
+            print(docker_daemon_error_message(daemon_reason), file=sys.stderr)
+            return 1
 
     if not args.urls.is_file():
         print(f"Missing URLs file: {args.urls}", file=sys.stderr)
@@ -342,11 +349,21 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     elif _fail_to_pass_len(row) < 1:
                         skipped_f2p += 1
-                        print(
-                            f"# skip {pr.instance_id}: not written "
-                            f"(empty FAIL_TO_PASS or install/patch apply failed)",
-                            file=sys.stderr,
-                        )
+                        from .docker_runtime import docker_daemon_available
+
+                        daemon_ok, _ = docker_daemon_available()
+                        if discover_docker and not daemon_ok:
+                            print(
+                                f"# skip {pr.instance_id}: not written "
+                                f"(Docker discover unavailable — start Docker Desktop)",
+                                file=sys.stderr,
+                            )
+                        else:
+                            print(
+                                f"# skip {pr.instance_id}: not written "
+                                f"(empty FAIL_TO_PASS or install/patch apply failed)",
+                                file=sys.stderr,
+                            )
                     else:
                         skipped_not_gradable += 1
                         print(

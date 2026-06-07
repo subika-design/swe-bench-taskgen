@@ -59,19 +59,20 @@ def make_repo_script_list_common(
 
 
 def env_apt_setup_commands(specs: dict) -> list[str]:
-    """Debian packages for the harness env image (required + optional best-effort)."""
-    cmds: list[str] = []
-    apt_pkgs = specs.get("apt-pkgs") or []
-    optional = specs.get("apt-pkgs-optional") or []
-    if apt_pkgs or optional:
-        cmds.append("apt-get update -qq")
-    if apt_pkgs:
-        cmds.append(f"apt-get install -y --no-install-recommends {' '.join(apt_pkgs)}")
-    for pkg in optional:
-        cmds.append(
-            f"apt-get install -y --no-install-recommends {pkg} || true"
-        )
-    return cmds
+    """Debian packages for the harness env image (required core + optional best-effort)."""
+    from swe_rebench_pr.apt_from_log import (
+        resilient_apt_install_shell_lines,
+        sanitize_apt_package_names,
+        split_apt_packages_core_optional,
+    )
+
+    apt_pkgs = sanitize_apt_package_names(list(specs.get("apt-pkgs") or []))
+    optional = sanitize_apt_package_names(list(specs.get("apt-pkgs-optional") or []))
+    core, from_required = split_apt_packages_core_optional(apt_pkgs)
+    optional = sanitize_apt_package_names([*from_required, *optional])
+    if not core and not optional:
+        return []
+    return resilient_apt_install_shell_lines([*core, *optional])
 
 
 def make_env_script_list_common(instance, specs, env_name) -> list:

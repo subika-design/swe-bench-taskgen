@@ -14,7 +14,15 @@ from .apt_from_log import (
 
 _CMAKE_BASE_APT = ("cmake",)
 _PREMAKE_BASE_APT = ("uuid-dev",)
+_MESON_BASE_APT = ("meson", "ninja-build")
 _C_COMMON_APT = ("git", "build-essential", "pkg-config")
+_MESON_NOT_FOUND_RE = re.compile(r"\bmeson:\s*command not found\b", re.I)
+_NINJA_NOT_FOUND_RE = re.compile(r"\bninja:\s*command not found\b", re.I)
+_MESON_INSTALL = (
+    'meson setup build --wipe 2>/dev/null || rm -rf build && meson setup build && '
+    'meson compile -C build -j"$(nproc)"'
+)
+_MESON_TEST_CMD = "meson test -C build --print-errorlogs"
 _CMAKE_FIND_PACKAGE_RE = re.compile(r"find_package\s*\(\s*([A-Za-z0-9_+\-.]+)", re.IGNORECASE)
 _CMAKE_PKG_CHECK_RE = re.compile(r"pkg_check_modules\s*\([^)]*\b([A-Za-z0-9_+\-.]+)\b", re.IGNORECASE)
 _CMAKE_PACKAGE_APT: dict[str, tuple[str, ...]] = {
@@ -38,6 +46,31 @@ def is_premake_repo(repo: Path) -> bool:
         (repo / "premake5.lua").is_file()
         and ((repo / "Bootstrap.mak").is_file() or (repo / "Bootstrap.sh").is_file())
     )
+
+
+def is_meson_repo(repo: Path) -> bool:
+    """True for native C/C++ Meson projects (not Python meson-python backends)."""
+    if not (repo / "meson.build").is_file():
+        return False
+    from .repo_detect import repo_uses_meson_python_backend
+
+    if repo_uses_meson_python_backend(repo) and (repo / "pyproject.toml").is_file():
+        return False
+    return True
+
+
+def is_meson_config(cfg: dict[str, Any], *, repo: Path | None = None) -> bool:
+    if str(cfg.get("c_build_system") or "").lower() == "meson":
+        return True
+    if repo is not None and is_meson_repo(repo):
+        return True
+    install = str(cfg.get("install") or "").lower()
+    test_cmd = str(cfg.get("test_cmd") or "").lower()
+    return "meson setup" in install or "meson compile" in install or "meson test" in test_cmd
+
+
+def log_indicates_meson_tool_missing(log: str) -> bool:
+    return bool(_MESON_NOT_FOUND_RE.search(log or "") or _NINJA_NOT_FOUND_RE.search(log or ""))
 
 
 def is_premake_config(cfg: dict[str, Any], *, repo: Path | None = None) -> bool:
@@ -181,6 +214,30 @@ def premake_test_cmd_for_targets(
     return "bin/release/premake5 test --test-all"
 
 
+def meson_install_config_for_repo(
+    repo: Path,
+    *,
+    base: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Heuristic ``install_config`` for native Meson C/C++ repos."""
+    cfg = dict(base or {})
+    cfg["language"] = "c"
+    cfg["c_build_system"] = "meson"
+    cfg["result_format"] = "googletest_log"
+    cfg["install"] = _MESON_INSTALL
+    cfg["test_cmd"] = _MESON_TEST_CMD
+    for key in ("pip_packages", "reqs_path", "pytest_plugins", "python"):
+        cfg.pop(key, None)
+    post = list(cfg.get("post_install") or [])
+    cfg["post_install"] = [
+        ln for ln in post if "pip install" not in str(ln).lower() and "meson-python" not in str(ln).lower()
+    ]
+    out = remediate_apt_install_from_log(dict(cfg), "")
+    out = merge_apt_into_config(out, list(_C_COMMON_APT))
+    out = merge_apt_into_config(out, list(_MESON_BASE_APT))
+    return out
+
+
 def premake_install_config_for_repo(
     repo: Path,
     *,
@@ -218,16 +275,26 @@ def is_c_harness_config(cfg: dict[str, Any], *, repo: Path | None = None) -> boo
         return True
     if repo is not None and is_premake_repo(repo):
         return True
+    if repo is not None and is_meson_repo(repo):
+        return True
     if repo is not None and (repo / "CMakeLists.txt").is_file():
         return True
     install = str(cfg.get("install") or "").lower()
     test_cmd = str(cfg.get("test_cmd") or "").lower()
-    return "cmake" in install or "ctest" in test_cmd or "make " in install or is_premake_config(cfg)
+    return (
+        "cmake" in install
+        or "ctest" in test_cmd
+        or "make " in install
+        or is_premake_config(cfg)
+        or is_meson_config(cfg, repo=repo)
+    )
 
 
 def _base_apt_for_config(cfg: dict[str, Any], *, repo: Path | None = None) -> tuple[str, ...]:
     if is_premake_config(cfg, repo=repo):
         return _PREMAKE_BASE_APT
+    if is_meson_config(cfg, repo=repo):
+        return _MESON_BASE_APT
     return _CMAKE_BASE_APT
 
 
@@ -304,6 +371,10 @@ def remediate_c_install_from_log(
     out = remediate_apt_install_from_log(dict(cfg), log)
     out = merge_apt_into_config(out, list(_C_COMMON_APT))
     out = merge_apt_into_config(out, list(_base_apt_for_config(out, repo=repo)))
+    if log_indicates_meson_tool_missing(log):
+        out = merge_apt_into_config(out, list(_MESON_BASE_APT))
+        if repo is not None and is_meson_repo(repo):
+            out = meson_install_config_for_repo(repo, base=out)
     if log_indicates_ngtcp2_quictls_missing(log) and repo is not None:
         from .integration_build import remediate_quictls_native_integration
 
@@ -329,6 +400,13 @@ def ensure_c_install_config(
             test_paths=test_paths,
             test_patch=test_patch,
         )
+        if log:
+            out = remediate_c_install_from_log(
+                out, log, repo=repo, test_paths=test_paths
+            )
+        return out
+    if repo is not None and is_meson_repo(repo):
+        out = meson_install_config_for_repo(repo, base=cfg)
         if log:
             out = remediate_c_install_from_log(
                 out, log, repo=repo, test_paths=test_paths
@@ -395,8 +473,16 @@ def merge_c_harness_fields_after_llm(before: dict[str, Any], after: dict[str, An
         out["install"] = inst_before
     elif ("cmake" in inst_before or "make" in inst_before) and "pip install" in inst_after:
         out["install"] = inst_before
+    meson_before = "meson" in inst_before.lower() or "meson" in tc_before.lower()
+    if meson_before and "meson" not in inst_after.lower() and "meson" not in tc_after.lower():
+        out["install"] = inst_before
+        if tc_before:
+            out["test_cmd"] = tc_before
     if is_premake_config(before) and not is_premake_config(out):
         out["c_build_system"] = before.get("c_build_system") or "premake"
+        out["result_format"] = before.get("result_format") or "googletest_log"
+    if is_meson_config(before) and not is_meson_config(out):
+        out["c_build_system"] = before.get("c_build_system") or "meson"
         out["result_format"] = before.get("result_format") or "googletest_log"
     return ensure_c_base_pre_install(out)
 

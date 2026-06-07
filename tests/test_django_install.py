@@ -127,7 +127,8 @@ def test_heuristic_fix_harness_build_pylibmc():
     )
     pre = "\n".join(cfg.get("pre_install") or [])
     assert "libmemcached-dev" in pre
-    assert "libmemcached-dev" in (cfg.get("apt-pkgs") or [])
+    apt = (cfg.get("apt-pkgs") or []) + (cfg.get("apt-pkgs-optional") or [])
+    assert "libmemcached-dev" in apt
 
 
 def test_env_script_installs_apt_before_pip_for_pylibmc():
@@ -147,9 +148,9 @@ def test_merge_pre_install_adds_mysql_packages():
         ],
         ["pkg-config", "libmariadb-dev"],
     )
-    install_line = [ln for ln in pre if ln.startswith("apt-get install")][0]
-    assert "pkg-config" in install_line
-    assert "libmariadb-dev" in install_line
+    joined = "\n".join(pre)
+    assert "pkg-config" in joined
+    assert "libmariadb-dev" in joined
 
 
 def test_render_django_pytest_settings_includes_test_apps():

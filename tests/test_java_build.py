@@ -279,6 +279,7 @@ def test_java_install_config_gradle_includes_build(tmp_path: Path):
         tmp_path, test_paths=paths, gradle_path_by_test_path=gradle_map
     )
     assert "build -x test" in cfg["install"]
+    assert "-x check" in cfg["install"]
     assert cfg["gradle_junit_roots"] == ["picocli-tests-java8/build/test-results"]
     assert ":picocli-tests-java8:test" in cfg["test_cmd"]
     assert ":picocli:test" not in cfg["test_cmd"]

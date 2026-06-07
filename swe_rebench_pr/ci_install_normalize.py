@@ -191,28 +191,32 @@ def normalize_ci_install_command(line: str, *, language: str = "python") -> str:
     return s
 
 
+_GRADLE_HARNESS_BUILD_EXCLUDES = "-x test -x check"
+
+
 def _normalize_gradlew_build_command(line: str) -> str:
     """Map CI ``./gradlew clean build`` to a Docker-replayable compile install."""
     low = line.lower()
     parts = ["chmod +x ./gradlew 2>/dev/null || true"]
     if "./gradlew --stop" in low or re.search(r"\./gradlew\s+--stop", low):
         parts.insert(0, "./gradlew --stop 2>/dev/null || true")
+    excludes = _GRADLE_HARNESS_BUILD_EXCLUDES
     if "clean" in low and "build" in low:
         parts.append(
-            "./gradlew --no-daemon clean build -x test --continue "
+            f"./gradlew --no-daemon clean build {excludes} --continue "
             "|| ./gradlew --no-daemon classes --continue"
         )
     elif "build" in low:
         parts.append(
-            "./gradlew --no-daemon build -x test --continue "
+            f"./gradlew --no-daemon build {excludes} --continue "
             "|| ./gradlew --no-daemon classes --continue"
         )
     elif "assemble" in low:
-        parts.append("./gradlew --no-daemon assemble -x test --continue || true")
+        parts.append(f"./gradlew --no-daemon assemble {excludes} --continue || true")
     elif "compile" in low:
         parts.append("./gradlew --no-daemon classes --continue || true")
     else:
-        parts.append("./gradlew --no-daemon build -x test --continue || true")
+        parts.append(f"./gradlew --no-daemon build {excludes} --continue || true")
     return " && ".join(parts)
 
 

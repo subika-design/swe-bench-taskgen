@@ -1088,15 +1088,29 @@ def _php_body(
         + r"""_run_php_tests() {
   local junit_out="$1"
   local log_out="$2"
+  _php_test_cmd_probe_bin() {
+    local raw="$1"
+    raw="${raw%%||*}"
+    raw="${raw%%2>/dev/null*}"
+    raw="${raw%%--log-junit*}"
+    raw="${raw%% *}"
+    raw="${raw#./}"
+    printf '%s' "$raw"
+  }
   if [[ -n "${PHP_TEST_CMD:-}" ]]; then
     local cmd="${PHP_TEST_CMD//__JUNIT_OUT__/$junit_out}"
-    echo "[docker] php test_cmd=$cmd" >&2
-    if [[ ${#T[@]} -gt 0 ]]; then
-      eval "$cmd" "${T[@]}" 2>&1 | tee "$log_out" || true
-    else
-      eval "$cmd" 2>&1 | tee "$log_out" || true
+    local probe
+    probe="$(_php_test_cmd_probe_bin "$cmd")"
+    if [[ -n "$probe" && -x "$probe" ]]; then
+      echo "[docker] php test_cmd=$cmd" >&2
+      if [[ ${#T[@]} -gt 0 ]]; then
+        eval "$cmd" "${T[@]}" 2>&1 | tee "$log_out" || true
+      else
+        eval "$cmd" 2>&1 | tee "$log_out" || true
+      fi
+      return 0
     fi
-    return 0
+    echo "[docker] php test_cmd bin missing ($probe); falling back to discovery" >&2
   fi
   if [[ -x vendor/bin/simple-phpunit ]]; then
     echo "[docker] php simple-phpunit ${#T[@]} path(s)" >&2
@@ -1106,6 +1120,20 @@ def _php_body(
   if [[ -x vendor/bin/phpunit ]]; then
     echo "[docker] php phpunit ${#T[@]} path(s)" >&2
     vendor/bin/phpunit --log-junit "$junit_out" "${T[@]}" 2>&1 | tee "$log_out" || true
+    return 0
+  fi
+  local phpunit_bin
+  phpunit_bin="$(find . \( -path './tools/*/bin/phpunit' -o -path './vendor-bin/*/bin/phpunit' -o -path '*/vendor/bin/phpunit' \) -executable 2>/dev/null | head -1)"
+  if [[ -n "$phpunit_bin" ]]; then
+    echo "[docker] php phpunit via $phpunit_bin ${#T[@]} path(s)" >&2
+    "$phpunit_bin" --log-junit "$junit_out" "${T[@]}" 2>&1 | tee "$log_out" || true
+    return 0
+  fi
+  local simple_bin
+  simple_bin="$(find . \( -path './tools/*/bin/simple-phpunit' -o -path './vendor-bin/*/bin/simple-phpunit' -o -path '*/vendor/bin/simple-phpunit' \) -executable 2>/dev/null | head -1)"
+  if [[ -n "$simple_bin" ]]; then
+    echo "[docker] php simple-phpunit via $simple_bin ${#T[@]} path(s)" >&2
+    "$simple_bin" --log-junit "$junit_out" "${T[@]}" 2>&1 | tee "$log_out" || true
     return 0
   fi
   echo "[docker] php: no vendor/bin/phpunit or simple-phpunit" >&2

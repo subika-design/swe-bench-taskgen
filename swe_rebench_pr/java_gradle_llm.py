@@ -27,6 +27,8 @@ _JDK9PLUS_TEST_MODULE_RE = re.compile(
     re.I,
 )
 _PACKAGE_DECL_RE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.MULTILINE)
+_SETTINGS_PATCH_FILES = ("settings.gradle", "settings.gradle.kts")
+_GRADLE_PROJECTS_OUTPUT_RE = re.compile(r"""Project\s+'(:[^']+)'""")
 
 
 def _module_dir_from_test_rel(rel_path: str) -> str:
@@ -264,38 +266,121 @@ def _include_to_project(include_path: str) -> str:
     return _normalize_gradle_project(":".join(parts))
 
 
-def discover_gradle_projects_from_settings(repo: Path) -> GradleProjectIndex:
-    """Parse ``settings.gradle`` / ``settings.gradle.kts`` for ``include`` and ``projectDir``."""
+def parse_gradle_settings_text(text: str) -> GradleProjectIndex:
+    """Parse Gradle settings content for ``include`` and ``projectDir`` declarations."""
     projects: set[str] = set()
     dir_pairs: set[tuple[str, str]] = set()
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("include") and "include(" not in stripped:
+            continue
+        for m in re.finditer(r"""['"]([^'"]+)['"]""", line):
+            proj = _include_to_project(m.group(1))
+            if proj:
+                projects.add(proj)
+    if not projects:
+        for m in _INCLUDE_RE.finditer(text or ""):
+            proj = _include_to_project(m.group(1))
+            if proj:
+                projects.add(proj)
+    for m in _PROJECT_DIR_RE.finditer(text or ""):
+        proj = _normalize_gradle_project(m.group(1))
+        dir_rel = m.group(2).replace("\\", "/").strip("/")
+        if proj and dir_rel:
+            projects.add(proj)
+            dir_pairs.add((dir_rel, proj))
+    return GradleProjectIndex(frozenset(projects), frozenset(dir_pairs))
+
+
+def discover_gradle_projects_from_settings(repo: Path) -> GradleProjectIndex:
+    """Parse ``settings.gradle`` / ``settings.gradle.kts`` for ``include`` and ``projectDir``."""
+    parts: list[str] = []
     for name in ("settings.gradle.kts", "settings.gradle"):
         path = repo / name
         if not path.is_file():
             continue
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")[:80_000]
+            parts.append(path.read_text(encoding="utf-8", errors="replace")[:80_000])
         except OSError:
             continue
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped.startswith("include") and "include(" not in stripped:
-                continue
-            for m in re.finditer(r"""['"]([^'"]+)['"]""", line):
-                proj = _include_to_project(m.group(1))
-                if proj:
-                    projects.add(proj)
-        if not projects:
-            for m in _INCLUDE_RE.finditer(text):
-                proj = _include_to_project(m.group(1))
-                if proj:
-                    projects.add(proj)
-        for m in _PROJECT_DIR_RE.finditer(text):
-            proj = _normalize_gradle_project(m.group(1))
-            dir_rel = m.group(2).replace("\\", "/").strip("/")
-            if proj and dir_rel:
-                projects.add(proj)
-                dir_pairs.add((dir_rel, proj))
+    if not parts:
+        return GradleProjectIndex(frozenset(), frozenset())
+    return parse_gradle_settings_text("\n".join(parts))
+
+
+def _patch_chunks_for_settings(patch: str) -> list[str]:
+    chunks: list[str] = []
+    if not patch:
+        return chunks
+    for fname in _SETTINGS_PATCH_FILES:
+        marker = f"diff --git a/{fname} b/{fname}"
+        start = patch.find(marker)
+        if start < 0:
+            continue
+        next_diff = patch.find("\ndiff --git ", start + 1)
+        chunks.append(patch[start:next_diff] if next_diff >= 0 else patch[start:])
+    return chunks
+
+
+def _synthetic_settings_from_patch_chunk(chunk: str) -> str:
+    lines: list[str] = []
+    for line in chunk.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            lines.append(line[1:])
+        elif line.startswith(" "):
+            lines.append(line[1:])
+    return "\n".join(lines)
+
+
+def discover_gradle_projects_from_patches(*patches: str) -> GradleProjectIndex:
+    """Extract Gradle project declarations added in PR patch hunks."""
+    synthetic_parts: list[str] = []
+    for patch in patches:
+        for chunk in _patch_chunks_for_settings(patch):
+            text = _synthetic_settings_from_patch_chunk(chunk)
+            if text.strip():
+                synthetic_parts.append(text)
+    if not synthetic_parts:
+        return GradleProjectIndex(frozenset(), frozenset())
+    return parse_gradle_settings_text("\n".join(synthetic_parts))
+
+
+def merge_gradle_project_indices(*indices: GradleProjectIndex) -> GradleProjectIndex:
+    projects: set[str] = set()
+    dir_pairs: set[tuple[str, str]] = set()
+    for idx in indices:
+        projects.update(idx.projects)
+        dir_pairs.update(idx.dir_to_project)
     return GradleProjectIndex(frozenset(projects), frozenset(dir_pairs))
+
+
+def discover_gradle_projects(repo: Path, *patches: str) -> GradleProjectIndex:
+    """Merge on-disk settings with project declarations from PR patches."""
+    return merge_gradle_project_indices(
+        discover_gradle_projects_from_settings(repo),
+        discover_gradle_projects_from_patches(*patches),
+    )
+
+
+def parse_gradle_projects_command_output(text: str) -> GradleProjectIndex:
+    """Parse ``./gradlew projects`` output into a project index."""
+    projects: set[str] = set()
+    for m in _GRADLE_PROJECTS_OUTPUT_RE.finditer(text or ""):
+        proj = _normalize_gradle_project(m.group(1))
+        if proj:
+            projects.add(proj)
+    return GradleProjectIndex(frozenset(projects), frozenset())
+
+
+def _is_invalid_wrapper_colon_project(project: str, index: GradleProjectIndex) -> bool:
+    """Reject guessed paths like ``:modules:doris`` when not declared in settings."""
+    norm = _normalize_gradle_project(project)
+    if norm in index.projects:
+        return False
+    parts = norm.lstrip(":").split(":")
+    return len(parts) >= 2 and parts[0] in _WRAPPER_DIRS
 
 
 def _format_gradle_projects_block(index: GradleProjectIndex) -> str:
@@ -542,6 +627,15 @@ def resolve_gradle_project_for_test_path(
     if is_repo_root_java_test_rel(norm_l):
         return _root_gradle_project(index, repo)
 
+    from .java_build import module_prefix_before_java_test
+
+    prefix = module_prefix_before_java_test(norm)
+    if prefix is not None and prefix != "":
+        for dir_rel, proj in index.dir_to_project:
+            d = dir_rel.strip("/")
+            if prefix == d or prefix.endswith("/" + d):
+                return proj
+
     disk = _find_test_file_on_disk(repo, norm)
     rel = disk.relative_to(repo).as_posix() if disk is not None else norm_l
 
@@ -551,9 +645,6 @@ def resolve_gradle_project_for_test_path(
     if owners:
         return owners[0]
 
-    from .java_build import module_prefix_before_java_test
-
-    prefix = module_prefix_before_java_test(norm)
     if prefix is None:
         return None
     if prefix == "":
@@ -570,6 +661,32 @@ def resolve_gradle_project_for_test_path(
     return _fallback_map_test_path(norm, index, repo)
 
 
+def _project_owns_test_path_via_index(
+    path: str,
+    project: str,
+    index: GradleProjectIndex,
+    repo: Path,
+) -> bool:
+    """True when ``index`` (incl. patch overlay) maps the test path prefix to ``project``."""
+    from .java_build import module_prefix_before_java_test
+
+    proj = _normalize_gradle_project(project)
+    if not proj or proj not in index.projects:
+        return False
+    norm = path.replace("\\", "/").strip()
+    prefix = module_prefix_before_java_test(norm)
+    if prefix is None:
+        return False
+    if prefix == "":
+        return proj == _root_gradle_project(index, repo)
+    for dir_rel, mapped in index.dir_to_project:
+        d = dir_rel.strip("/")
+        if prefix == d or prefix.endswith("/" + d):
+            return proj == mapped
+    tail = prefix.split("/")[-1]
+    return proj.lstrip(":").split(":")[-1] == tail
+
+
 def _mapping_matches_test_path(
     path: str,
     project: str,
@@ -577,6 +694,8 @@ def _mapping_matches_test_path(
     repo: Path,
 ) -> bool:
     """Reject LLM guesses that do not own the test file path."""
+    if _project_owns_test_path_via_index(path, project, index, repo):
+        return True
     proj = _normalize_gradle_project(project)
     disk = _find_test_file_on_disk(repo, path)
     if disk is not None:
@@ -615,8 +734,11 @@ def _fallback_map_test_path(path: str, index: GradleProjectIndex, repo: Path | N
     if len(parts) >= 2 and parts[0] in _WRAPPER_DIRS:
         candidates.append(parts[1])
     if len(parts) >= 2:
-        candidates.append(":".join(parts[-2:]))
+        joined = ":".join(parts[-2:])
+        candidates.append(joined)
         candidates.append(f"{parts[-2]}:{parts[-1]}")
+        if _is_invalid_wrapper_colon_project(_normalize_gradle_project(joined), index):
+            candidates = [c for c in candidates if c != joined and c != f"{parts[-2]}:{parts[-1]}"]
 
     name_to_proj: dict[str, str] = {}
     for proj in index.projects:
@@ -640,6 +762,8 @@ def _fallback_map_test_path(path: str, index: GradleProjectIndex, repo: Path | N
         norm = _normalize_gradle_project(cand)
         if norm in index.projects:
             return norm
+        if _is_invalid_wrapper_colon_project(norm, index):
+            continue
 
     return None
 
@@ -716,6 +840,9 @@ def resolve_gradle_projects_for_test_paths(
     timeout_s: int = 120,
     repo_id: str = "",
     instance_id: str = "",
+    patch: str = "",
+    test_patch: str = "",
+    gradle_projects_output: str = "",
 ) -> dict[str, str]:
     """
     Map each test path to a Gradle project path (``:foo`` or ``:a:b``).
@@ -726,7 +853,12 @@ def resolve_gradle_projects_for_test_paths(
     if not paths:
         return {}
 
-    index = discover_gradle_projects_from_settings(repo)
+    index = discover_gradle_projects(repo, patch, test_patch)
+    if gradle_projects_output.strip():
+        index = merge_gradle_project_indices(
+            index,
+            parse_gradle_projects_command_output(gradle_projects_output),
+        )
     out: dict[str, str] = {}
 
     for p in paths:

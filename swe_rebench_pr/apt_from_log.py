@@ -26,6 +26,8 @@ BUILD_LOG_APT_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("curl/curl.h", ("libcurl4-openssl-dev",)),
     ("zlib.h", ("zlib1g-dev",)),
     ("libxml2", ("libxml2-dev",)),
+    ("libxml-2.0", ("libxml2-dev",)),
+    ("package 'libxml-2.0'", ("libxml2-dev",)),
     ("libffi.h", ("libffi-dev",)),
     ("pcre.h", ("libpcre3-dev",)),
     ("readline/readline.h", ("libreadline-dev",)),
@@ -83,6 +85,44 @@ BUILD_LOG_APT_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 _BASE_BUILD_APT = ("git", "build-essential", "pkg-config")
 
+# Must succeed in env/pre_install; everything else is best-effort (``|| true``).
+# PHP ``docker-php-ext-install`` dev libs — must succeed before compiling extensions.
+_PHP_EXT_BUILD_APT = frozenset(
+    {
+        "libxml2-dev",
+        "libzip-dev",
+        "libicu-dev",
+        "libcurl4-openssl-dev",
+    }
+)
+
+_APT_REQUIRED_CORE = frozenset(
+    {
+        *_BASE_BUILD_APT,
+        *_PHP_EXT_BUILD_APT,
+        "cmake",
+        "meson",
+        "ninja-build",
+        "unzip",
+        "curl",
+        "ca-certificates",
+        "python3",
+        "python3-pip",
+        "python3-dev",
+        "python3-venv",
+    }
+)
+
+_APT_NOT_FOUND_RE = re.compile(r"E:\s*Unable to locate package\s+(\S+)", re.I)
+_APT_INSTALL_LINE = re.compile(
+    r"^apt-get install -y(?:\s+--no-install-recommends)?\s+(.*)$",
+    re.IGNORECASE,
+)
+_APT_UPDATE_INSTALL_LINE = re.compile(
+    r"^(apt-get update(?:\s+-qq)?)\s*&&\s*apt-get install -y(?:\s+--no-install-recommends)?\s+(.*)$",
+    re.IGNORECASE,
+)
+
 
 def apt_packages_from_build_log(log: str) -> list[str]:
     """Infer missing Debian packages from install/compile/test logs."""
@@ -119,16 +159,167 @@ def sanitize_apt_package_names(pkgs: Iterable[str]) -> list[str]:
     return out
 
 
+def split_apt_packages_core_optional(pkgs: Iterable[str]) -> tuple[list[str], list[str]]:
+    """Split Debian packages into required core vs best-effort optional installs."""
+    core: list[str] = []
+    optional: list[str] = []
+    seen: set[str] = set()
+    for raw in pkgs:
+        pkg = str(raw).strip()
+        if not pkg:
+            continue
+        low = pkg.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        if low in _APT_REQUIRED_CORE:
+            core.append(pkg)
+        else:
+            optional.append(pkg)
+    return core, optional
+
+
+def apt_packages_not_found_in_log(log: str) -> list[str]:
+    """Parse ``E: Unable to locate package …`` lines from apt/build logs."""
+    if not log:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _APT_NOT_FOUND_RE.finditer(log):
+        pkg = m.group(1).strip()
+        low = pkg.lower()
+        if pkg and low not in seen:
+            seen.add(low)
+            out.append(pkg)
+    return out
+
+
+def log_indicates_apt_package_not_found(log: str) -> bool:
+    return bool(apt_packages_not_found_in_log(log))
+
+
+def _extract_apt_packages_from_pre_install(pre_install: Iterable[str]) -> list[str]:
+    pkgs: list[str] = []
+    seen: set[str] = set()
+    for ln in pre_install:
+        stripped = str(ln).strip()
+        combined = _APT_UPDATE_INSTALL_LINE.match(stripped)
+        if combined:
+            for pkg in combined.group(2).split():
+                if pkg not in seen:
+                    seen.add(pkg)
+                    pkgs.append(pkg)
+            continue
+        m = _APT_INSTALL_LINE.match(stripped)
+        if m:
+            for pkg in m.group(1).split():
+                if pkg not in seen:
+                    seen.add(pkg)
+                    pkgs.append(pkg)
+    return pkgs
+
+
+def _is_apt_install_shell_line(line: str) -> bool:
+    stripped = str(line).strip().lower()
+    return stripped.startswith("apt-get install") or (
+        "apt-get update" in stripped and "apt-get install" in stripped
+    )
+
+
+def resilient_apt_install_shell_lines(
+    pkgs: Iterable[str],
+    *,
+    include_update: bool = True,
+) -> list[str]:
+    """
+    Emit apt install commands that tolerate missing optional packages.
+
+    Core build tools must install; CI/LLM-inferred dev libs install with ``|| true``.
+    """
+    sanitized = sanitize_apt_package_names(list(pkgs))
+    if not sanitized:
+        return []
+    core, optional = split_apt_packages_core_optional(sanitized)
+    lines: list[str] = []
+    if include_update:
+        lines.append("apt-get update -qq")
+    if core:
+        lines.append(
+            "apt-get install -y --no-install-recommends " + " ".join(core)
+        )
+    for pkg in optional:
+        lines.append(
+            f"apt-get install -y --no-install-recommends {pkg} || true"
+        )
+    return lines
+
+
+def remove_apt_packages_from_config(
+    cfg: dict[str, Any],
+    remove: Iterable[str],
+) -> dict[str, Any]:
+    """Drop unavailable Debian packages from ``apt-pkgs``, optional list, and ``pre_install``."""
+    drop = {str(p).strip().lower() for p in remove if str(p).strip()}
+    if not drop:
+        return cfg
+    out = dict(cfg)
+
+    def _filter_pkgs(vals: list[str]) -> list[str]:
+        return [p for p in vals if str(p).strip().lower() not in drop]
+
+    apt = _filter_pkgs(list(out.get("apt-pkgs") or []))
+    if apt:
+        out["apt-pkgs"] = apt
+    else:
+        out.pop("apt-pkgs", None)
+
+    opt = _filter_pkgs(list(out.get("apt-pkgs-optional") or []))
+    if opt:
+        out["apt-pkgs-optional"] = opt
+    else:
+        out.pop("apt-pkgs-optional", None)
+
+    pre = list(out.get("pre_install") or [])
+    non_apt = [ln for ln in pre if not _is_apt_install_shell_line(ln)]
+    kept_pkgs = [
+        p
+        for p in _extract_apt_packages_from_pre_install(pre)
+        if p.lower() not in drop
+    ]
+    out["pre_install"] = non_apt + resilient_apt_install_shell_lines(kept_pkgs)
+    return out
+
+
+def remediate_missing_apt_packages_from_log(cfg: dict[str, Any], log: str) -> dict[str, Any]:
+    """Remove apt packages that the target image's apt index cannot locate."""
+    missing = apt_packages_not_found_in_log(log)
+    if not missing:
+        return cfg
+    return remove_apt_packages_from_config(cfg, missing)
+
+
 def merge_apt_into_config(cfg: dict[str, Any], deb_packages: list[str]) -> dict[str, Any]:
-    """Merge Debian packages into ``pre_install`` and ``apt-pkgs``."""
+    """Merge Debian packages into ``pre_install``, ``apt-pkgs``, and ``apt-pkgs-optional``."""
     deb_packages = sanitize_apt_package_names(deb_packages)
     if not deb_packages:
         return cfg
+    core, optional = split_apt_packages_core_optional(deb_packages)
     out = dict(cfg)
-    pre = list(out.get("pre_install") or [])
-    out["pre_install"] = merge_pre_install_debian_packages(pre, list(deb_packages))
-    apt = sanitize_apt_package_names(list(out.get("apt-pkgs") or []) + deb_packages)
-    out["apt-pkgs"] = apt
+    if core or optional:
+        pre = list(out.get("pre_install") or [])
+        out["pre_install"] = merge_pre_install_debian_packages(pre, [*core, *optional])
+    if core:
+        apt = sanitize_apt_package_names(list(out.get("apt-pkgs") or []) + core)
+        out["apt-pkgs"] = apt
+    if optional:
+        existing = sanitize_apt_package_names(out.get("apt-pkgs-optional") or [])
+        seen = set(existing)
+        merged_opt = list(existing)
+        for pkg in optional:
+            if pkg not in seen:
+                seen.add(pkg)
+                merged_opt.append(pkg)
+        out["apt-pkgs-optional"] = merged_opt
     return out
 
 
@@ -240,7 +431,8 @@ def ensure_base_build_apt(cfg: dict[str, Any]) -> dict[str, Any]:
 
 def remediate_apt_install_from_log(cfg: dict[str, Any], log: str) -> dict[str, Any]:
     """Apply log-driven apt package fixes (language-agnostic)."""
-    out = ensure_base_build_apt(dict(cfg))
+    out = remediate_missing_apt_packages_from_log(dict(cfg), log)
+    out = ensure_base_build_apt(out)
     deb = apt_packages_from_build_log(log)
     out = merge_apt_into_config(out, deb)
     if out.get("native_integration_build"):
