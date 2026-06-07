@@ -84,6 +84,12 @@ def build_install_config_for_repo(
         from .js_build import merge_js_build_into_config
 
         cfg = merge_js_build_into_config(cfg, repo, test_paths)
+    elif lang in ("ruby", "rb"):
+        from .languages import collect_test_targets
+        from .ruby_build import ruby_install_config_for_repo
+
+        paths = test_paths or collect_test_targets(language, patch, test_patch)
+        cfg = ruby_install_config_for_repo(repo, base=cfg, test_paths=paths)
     elif lang == "python":
         from .python_build import finalize_python_install_config, merge_python_build_into_config
 

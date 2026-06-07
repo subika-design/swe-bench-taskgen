@@ -494,6 +494,8 @@ def pytest_test_cmd_from_targets(targets: list[str], base_cmd: str = "") -> str:
     if not paths:
         return base
     flags = python_pytest_cmd_without_collection_paths(base)
+    if not flags.lower().startswith("pytest"):
+        flags = f"pytest {flags}".strip()
     return f"{flags} {' '.join(paths)}"
 
 
@@ -533,6 +535,28 @@ def python_pytest_cmd_without_collection_paths(cmd: str) -> str:
     return out or _DEFAULT_PYTEST_CMD
 
 
+def scope_python_test_cmd_for_harness(
+    cfg: dict[str, Any],
+    *,
+    test_patch: str = "",
+    test_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Ensure exported ``test_cmd`` runs only PR-scoped pytest targets (harness eval parity)."""
+    from .ci_fidelity import test_cmd_needs_explicit_pytest_paths
+    from .languages import collect_test_targets_from_test_patch, filter_python_pytest_targets
+
+    out = dict(cfg)
+    paths = list(test_paths or [])
+    if not paths and test_patch:
+        paths = collect_test_targets_from_test_patch("python", test_patch)
+    paths = filter_python_pytest_targets(paths)
+    if paths:
+        tc = str(out.get("test_cmd") or "")
+        if test_cmd_needs_explicit_pytest_paths(tc, paths):
+            out["test_cmd"] = pytest_test_cmd_from_targets(paths, tc)
+    return out
+
+
 def merge_python_build_into_config(
     cfg: dict[str, Any],
     repo: Path,
@@ -563,16 +587,18 @@ def expand_pytest_discover_targets(
     Normalize pytest path targets from ``test_patch`` for Docker ``targets.txt``.
 
     Keeps file paths, adds ``tests/`` when all targets live under one test tree, and
-    drops non-``.py`` paths that are not pytest collection targets.
+    drops non-runnable paths (e.g. Pygments ``*.output`` golden files).
     """
+    from .languages import is_pygments_data_test_path, is_pygments_golden_output
+
     out: list[str] = []
     seen: set[str] = set()
     py_paths: list[str] = []
     for raw in paths:
         p = raw.replace("\\", "/").strip().lstrip("/")
-        if not p:
+        if not p or is_pygments_golden_output(p):
             continue
-        if not p.endswith(".py"):
+        if not (p.endswith(".py") or is_pygments_data_test_path(p)):
             continue
         if p not in seen:
             seen.add(p)

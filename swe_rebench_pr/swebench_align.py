@@ -524,6 +524,65 @@ def repair_django_fail_pass_lists(
     return _dedupe_ordered(f2p), _dedupe_ordered(p2p)
 
 
+def _json_list_field(row: dict[str, Any], key: str) -> list[str]:
+    raw = row.get(key)
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(x) for x in raw]
+    try:
+        parsed = json.loads(str(raw) or "[]")
+    except json.JSONDecodeError:
+        return []
+    return [str(x) for x in parsed] if isinstance(parsed, list) else []
+
+
+def scope_install_config_test_cmd_for_harness(
+    row: dict[str, Any],
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Align ``install_config.test_cmd`` with discovery scope (``test_patch`` / F2P)."""
+    lang = str(row.get("language") or cfg.get("language") or "python").lower()
+    test_patch = str(row.get("test_patch") or "")
+    patch = str(row.get("patch") or "")
+    f2p = _json_list_field(row, "FAIL_TO_PASS")
+    p2p = _json_list_field(row, "PASS_TO_PASS")
+    out = dict(cfg)
+
+    if lang in ("ruby", "rb"):
+        from .ruby_build import scope_ruby_test_cmd_for_harness
+
+        return scope_ruby_test_cmd_for_harness(
+            out,
+            test_patch=test_patch,
+            patch=patch,
+            fail_to_pass=f2p,
+            pass_to_pass=p2p,
+        )
+
+    if lang == "python":
+        from .python_build import scope_python_test_cmd_for_harness
+
+        return scope_python_test_cmd_for_harness(out, test_patch=test_patch)
+
+    if lang in ("javascript", "js", "node", "typescript", "ts"):
+        from .languages import collect_test_targets_from_test_patch
+
+        paths = collect_test_targets_from_test_patch(lang, test_patch)
+        if paths:
+            from .js_build import js_test_cmd_from_targets
+
+            tc = str(out.get("test_cmd") or "")
+            runner = str(out.get("js_test_runner") or "jest").strip().lower()
+            if runner in ("jest", "vitest", "mocha") and not any(
+                p in tc for p in paths if p.endswith((".js", ".ts", ".jsx", ".tsx"))
+            ):
+                out["test_cmd"] = js_test_cmd_from_targets(paths, runner=runner)
+        return out
+
+    return out
+
+
 def repair_jsonl_row_install_config(row: dict[str, Any]) -> dict[str, Any]:
     """Normalize ``install_config`` for SWE-bench harness (docker_specs, Gradle flags)."""
     out = dict(row)
@@ -541,6 +600,7 @@ def repair_jsonl_row_install_config(row: dict[str, Any]) -> dict[str, Any]:
         return out
     lang = str(out.get("language") or ic.get("language") or "python").lower()
     ic["language"] = lang
+    ic = scope_install_config_test_cmd_for_harness(out, ic)
     out["install_config"] = export_install_config_for_harness(ic, language=lang)
     return out
 

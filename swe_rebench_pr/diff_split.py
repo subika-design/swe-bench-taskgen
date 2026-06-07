@@ -1113,10 +1113,13 @@ def junit_case_to_rspec_nodeid(
         if resolved:
             rel_s = resolved
     if rel_s:
-        if classname and classname != name and not classname.startswith(rel_s):
-            if "::" in classname or " " in classname:
-                return f"{rel_s}::{classname}::{name}" if name else f"{rel_s}::{classname}"
-        return f"{rel_s}::{name}" if name else rel_s
+        if classname and name and classname != name and not classname.startswith(rel_s):
+            return f"{rel_s}::{classname} {name}".strip()
+        if name:
+            return f"{rel_s}::{name}"
+        if classname:
+            return f"{rel_s}::{classname}"
+        return rel_s
     if classname:
         return f"{classname}::{name}" if name else classname
     return name

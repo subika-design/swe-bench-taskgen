@@ -221,6 +221,88 @@ def ruby_rspec_spec_paths(test_paths: list[str] | None) -> list[str]:
     return sorted(out)
 
 
+def ruby_rspec_spec_paths_from_nodeids(nodeids: list[str]) -> list[str]:
+    """Extract ``*_spec.rb`` paths from RSpec JUnit / log node ids (``path::example``)."""
+    from .diff_split import _nodeid_leading_relpath
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for nodeid in nodeids:
+        head = _nodeid_leading_relpath(str(nodeid)).replace("\\", "/").strip().lstrip("./")
+        if not head or not _path_likely_rspec(head):
+            continue
+        if head not in seen:
+            seen.add(head)
+            out.append(head)
+    return sorted(out)
+
+
+def _patch_touches_gemfile(patch: str) -> bool:
+    return bool(re.search(r"^diff --git a/Gemfile(?:\.lock)? ", patch or "", re.MULTILINE))
+
+
+def _ensure_ruby_bundle_eval_commands(
+    cfg: dict[str, Any],
+    *,
+    patch: str = "",
+) -> dict[str, Any]:
+    """Inject post-patch ``bundle install`` hook for SWE-bench harness eval."""
+    out = dict(cfg)
+    install = str(out.get("install") or "")
+    test_cmd = str(out.get("test_cmd") or "")
+    if (
+        "bundle" not in install
+        and "bundle" not in test_cmd
+        and not _patch_touches_gemfile(patch)
+    ):
+        return out
+    eval_cmds = list(out.get("eval_commands") or [])
+    hook = "bundle check >/dev/null 2>&1 || bundle install"
+    if hook not in eval_cmds:
+        eval_cmds.insert(0, hook)
+    out["eval_commands"] = eval_cmds
+    return out
+
+
+def scope_ruby_test_cmd_for_harness(
+    cfg: dict[str, Any],
+    *,
+    test_patch: str = "",
+    patch: str = "",
+    test_paths: list[str] | None = None,
+    fail_to_pass: list[str] | None = None,
+    pass_to_pass: list[str] | None = None,
+) -> dict[str, Any]:
+    """Ensure exported ``test_cmd`` runs only PR-scoped specs (harness eval parity)."""
+    out = dict(cfg)
+    paths = list(test_paths or [])
+    if not paths and test_patch:
+        from .languages import collect_test_targets_from_test_patch
+
+        paths = collect_test_targets_from_test_patch("ruby", test_patch)
+    spec_paths = ruby_rspec_spec_paths(paths)
+    if not spec_paths and (fail_to_pass or pass_to_pass):
+        spec_paths = ruby_rspec_spec_paths_from_nodeids(
+            list(fail_to_pass or []) + list(pass_to_pass or [])
+        )
+    if not spec_paths:
+        return _ensure_ruby_bundle_eval_commands(out, patch=patch)
+
+    runner = runner_from_install_config(out)
+    tc_raw = str(out.get("test_cmd") or "")
+    tc = _strip_ruby_rspec_junit_fallback(tc_raw)
+    from .ci_fidelity import rspec_cmd_needs_explicit_paths
+
+    if rspec_cmd_needs_explicit_paths(tc, spec_paths):
+        out["test_cmd"] = ruby_test_cmd_for_runner(runner, spec_paths=spec_paths)
+        out["ruby_test_runner"] = runner
+        out.pop("_ci_test_cmd_trusted", None)
+    elif tc != tc_raw:
+        out["test_cmd"] = tc
+    out = _merge_ruby_post_install(out, runner)
+    return _ensure_ruby_bundle_eval_commands(out, patch=patch)
+
+
 def ruby_test_cmd_for_docker_entry(cfg: dict[str, Any]) -> str:
     """CI/heuristic ``test_cmd`` for Docker when it is a Ruby test invocation."""
     from .ci_fidelity import should_preserve_ci_test_cmd
@@ -307,7 +389,13 @@ def apply_ruby_runner_to_config(
     tc = _strip_ruby_rspec_junit_fallback(tc_raw)
     preserve_ci = should_preserve_ci_test_cmd(out)
     spec_paths = ruby_rspec_spec_paths(test_paths)
-    if not preserve_ci:
+    from .ci_fidelity import rspec_cmd_needs_explicit_paths
+
+    needs_scope = bool(spec_paths) and rspec_cmd_needs_explicit_paths(tc, spec_paths)
+    if needs_scope:
+        out["test_cmd"] = ruby_test_cmd_for_runner(runner, spec_paths=spec_paths)
+        out.pop("_ci_test_cmd_trusted", None)
+    elif not preserve_ci:
         if not tc or tc == "true" or "pytest" in tc.lower():
             out["test_cmd"] = ruby_test_cmd_for_runner(runner, spec_paths=spec_paths)
         elif runner == "rspec" and "rspec" not in tc.lower():
@@ -537,5 +625,14 @@ def merge_ruby_harness_fields_after_llm(before: dict[str, Any], after: dict[str,
     if "rspec" in tc_before.lower() and "pytest" in tc_after.lower():
         out["test_cmd"] = tc_before
     if out.get("ruby_test_runner"):
-        out["test_cmd"] = ruby_test_cmd_for_runner(out["ruby_test_runner"])  # type: ignore[arg-type]
+        from .ci_fidelity import rspec_cmd_has_scoped_paths
+
+        tc_before_clean = _strip_ruby_rspec_junit_fallback(tc_before)
+        tc_after_clean = _strip_ruby_rspec_junit_fallback(tc_after)
+        if rspec_cmd_has_scoped_paths(tc_after_clean):
+            out["test_cmd"] = tc_after_clean
+        elif rspec_cmd_has_scoped_paths(tc_before_clean):
+            out["test_cmd"] = tc_before_clean
+        elif not tc_after_clean:
+            out["test_cmd"] = ruby_test_cmd_for_runner(out["ruby_test_runner"])  # type: ignore[arg-type]
     return ensure_ruby_docker_specs(out, language="ruby")

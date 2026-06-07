@@ -226,4 +226,4 @@ def test_harness_test_label_ruby_branch(tmp_path: Path):
         },
     )
     label = harness_test_label(case, repo, language="ruby")
-    assert label == "spec/foo_spec.rb::bar"
+    assert label == "spec/foo_spec.rb::Foo bar"

@@ -76,6 +76,8 @@ def should_preserve_ci_test_cmd(cfg: dict[str, Any]) -> bool:
 
 def pytest_cmd_has_scoped_paths(cmd: str) -> bool:
     """True when *cmd* names concrete test files or explicit pytest filters."""
+    from .languages import is_pygments_data_test_path
+
     s = str(cmd or "")
     if re.search(r"(?:^|\s)-[km]\s+", s) or "--ignore=" in s:
         return True
@@ -104,18 +106,41 @@ def pytest_cmd_has_scoped_paths(cmd: str) -> bool:
             continue
         if token.endswith(".py"):
             return True
-        if "/" in token and token.endswith(".py"):
+        if is_pygments_data_test_path(token):
             return True
     return False
 
 
 def pytest_cmd_needs_explicit_paths(cmd: str, test_paths: list[str]) -> bool:
-    """True when discover should append ``test_patch`` ``.py`` paths to CI pytest cmd."""
+    """True when discover should append ``test_patch`` paths to CI pytest cmd."""
+    from .languages import filter_python_pytest_targets, is_pygments_data_test_path
+
     if not test_paths:
         return False
-    if not any(p.endswith(".py") for p in test_paths):
+    runnable = filter_python_pytest_targets(test_paths)
+    if not runnable:
+        return False
+    if not any(p.endswith(".py") or is_pygments_data_test_path(p) for p in runnable):
         return False
     return not pytest_cmd_has_scoped_paths(cmd)
+
+
+def rspec_cmd_has_scoped_paths(cmd: str) -> bool:
+    """True when *cmd* names concrete ``*_spec.rb`` files."""
+    for token in str(cmd or "").split():
+        low = token.lower().strip("'\"")
+        if low.endswith("_spec.rb"):
+            return True
+        if "/spec/" in low and low.endswith(".rb"):
+            return True
+    return False
+
+
+def rspec_cmd_needs_explicit_paths(cmd: str, spec_paths: list[str]) -> bool:
+    """True when harness eval should append ``test_patch`` spec paths to CI rspec cmd."""
+    if not spec_paths:
+        return False
+    return not rspec_cmd_has_scoped_paths(cmd)
 
 
 # Backward-compatible aliases (avoid pytest collecting ``test_*`` names).
