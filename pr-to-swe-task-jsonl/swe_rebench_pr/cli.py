@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 from .builder import build_row, row_to_jsonl_line
+from .env_config import load_env as _load_taskgen_env
 from .gh_pr import parse_pr_url
 from .task_type import TASK_TYPE_SKIP, is_gradable_task_type
 from .llm_client import DEFAULT_LLM_MODEL, is_anthropic_model, resolve_llm_api_key
@@ -26,6 +27,8 @@ def read_urls(path: Path) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _load_taskgen_env()
+
     if shutil.which("gh") is None:
         print("This tool requires the GitHub CLI `gh` in PATH.", file=sys.stderr)
         return 1
@@ -250,21 +253,33 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_llm_patch_split and api_key:
         llm_patch = (api_key, base_url, model, to)
     elif not args.no_llm_patch_split and not api_key:
-        key_hint = "ANTHROPIC_API_KEY" if is_anthropic_model(model) else "OPENAI_API_KEY"
+        key_hint = (
+            "TASKGEN_ANTHROPIC_API_KEY"
+            if is_anthropic_model(model)
+            else "TASKGEN_OPENAI_API_KEY"
+        )
         print(f"# {key_hint} unset: heuristic patch/test_patch split", file=sys.stderr)
 
     llm_install: tuple[str, str, str, int] | None = None
     if not args.no_llm_install and api_key:
         llm_install = (api_key, base_url, model, to)
     elif not args.no_llm_install and not api_key:
-        key_hint = "ANTHROPIC_API_KEY" if is_anthropic_model(model) else "OPENAI_API_KEY"
+        key_hint = (
+            "TASKGEN_ANTHROPIC_API_KEY"
+            if is_anthropic_model(model)
+            else "TASKGEN_OPENAI_API_KEY"
+        )
         print(f"# {key_hint} unset: heuristic install_config only", file=sys.stderr)
 
     if discover_docker and not args.no_docker_llm_remediation and not api_key:
-        key_hint = "ANTHROPIC_API_KEY" if is_anthropic_model(model) else "OPENAI_API_KEY"
+        key_hint = (
+            "TASKGEN_ANTHROPIC_API_KEY"
+            if is_anthropic_model(model)
+            else "TASKGEN_OPENAI_API_KEY"
+        )
         print(
-            f"Docker test discovery requires {key_hint} (LLM remediation is enabled by default). "
-            "Set the key in the environment or pass --no-docker-llm-remediation to skip remediation.",
+            f"Docker test discovery requires {key_hint} in .env (LLM remediation is enabled by default). "
+            "Set the key or pass --no-docker-llm-remediation to skip remediation.",
             file=sys.stderr,
         )
         return 1

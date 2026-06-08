@@ -1,11 +1,6 @@
+.env
+output/
 __pycache__/
-*.py[cod]
+*.pyc
 .venv/
-*.egg-info/
-dist/
-build/
-.DS_Store
-output/
 .pytest_cache/
-logs/
-output/
